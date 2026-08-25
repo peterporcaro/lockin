@@ -21,17 +21,19 @@ Optional: flirpy (pip install flirpy) for direct .csq / .seq import -- see
 load_csq() below.
 """
 
+import hashlib
 import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 from scipy.ndimage import (gaussian_filter, binary_erosion, binary_dilation,
-                           binary_fill_holes, distance_transform_edt,
-                           map_coordinates)
+                           binary_closing, binary_fill_holes,
+                           distance_transform_edt, map_coordinates, label)
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Rectangle, Polygon
 
 
 def _fmt_dt(seconds):
@@ -719,18 +721,258 @@ def spatial_highpass(amp, sigma_px):
     return amp - gaussian_filter(amp, sigma_px)
 
 
-def part_mask(amp, threshold_frac=0.4, percentile=95, erosion_px=10):
+def _largest_component(mask):
+    """Keep only the largest connected True region of a binary mask."""
+    lbl, n = label(mask)
+    if n == 0:
+        return mask
+    sizes = np.bincount(lbl.ravel())
+    sizes[0] = 0        # background label
+    return lbl == np.argmax(sizes)
+
+
+def _point_in_mask(mask, x, y):
+    yi, xi = int(round(y)), int(round(x))
+    return 0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1] and bool(mask[yi, xi])
+
+
+def _component_size_at(mask, y, x):
+    """
+    Size (px) of the connected component of `mask` containing point (x, y),
+    or 0 if that point is False / out of bounds.  Used only for diagnostics
+    -- to tell "your point is in the wrong class entirely" apart from "your
+    point's class is right, but got fragmented and lost to
+    _largest_component()", which look identical from the outside (both end
+    up "not in the mask") but need a different fix (mask_polarity vs.
+    close_px / mask_roi).
+    """
+    yi, xi = int(round(y)), int(round(x))
+    if not (0 <= yi < mask.shape[0] and 0 <= xi < mask.shape[1]) or not mask[yi, xi]:
+        return 0
+    lbl, _ = label(mask)
+    return int((lbl == lbl[yi, xi]).sum())
+
+
+def _region_in_mask(mask, y0, y1, x0, x1, min_frac=0.5):
+    region = mask[y0:y1, x0:x1]
+    return region.size > 0 and region.mean() >= min_frac
+
+
+def _polygon_mask(shape, polygon_xy):
+    """Boolean mask, True inside the (x, y) polygon `polygon_xy`."""
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    pts = np.column_stack([xx.ravel(), yy.ravel()])
+    from matplotlib.path import Path
+    inside = Path(polygon_xy).contains_points(pts)
+    return inside.reshape(h, w)
+
+
+def _choose_polarity(amp, high, low, fiducial_roi, variance_sigma_px):
+    """
+    Decide which of the two Otsu classes (`high` = brighter, `low` =
+    darker) is the part.  See part_mask()'s docstring for the criteria.
+    Returns (chosen: "bright"|"dark", chosen_mask).
+    """
+    high_cc = _largest_component(high)
+    low_cc = _largest_component(low)
+
+    if fiducial_roi is not None:
+        y0, y1, x0, x1 = fiducial_roi
+        roi_high = high_cc[y0:y1, x0:x1]
+        roi_low = low_cc[y0:y1, x0:x1]
+        if roi_high.size:
+            high_frac, low_frac = float(roi_high.mean()), float(roi_low.mean())
+            if max(high_frac, low_frac) > 0.5:
+                choice = "bright" if high_frac >= low_frac else "dark"
+                print(f"  auto polarity: fiducial ROI is "
+                      f"{100 * max(high_frac, low_frac):.0f}% inside the "
+                      f"'{choice}' class's region -> selecting '{choice}'")
+                return choice, (high_cc if choice == "bright" else low_cc)
+
+    # No decisive fiducial ROI signal -- fall back to contiguity (does the
+    # largest component account for most of the class?) and large-scale
+    # variance (the part's coating is usually more spatially uniform than a
+    # cluttered background, at the scale of variance_sigma_px).
+    smooth = gaussian_filter(amp, sigma=variance_sigma_px)
+    high_contig = high_cc.sum() / max(high.sum(), 1)
+    low_contig = low_cc.sum() / max(low.sum(), 1)
+    high_var = float(smooth[high_cc].var()) if high_cc.any() else float("inf")
+    low_var = float(smooth[low_cc].var()) if low_cc.any() else float("inf")
+    high_score = high_contig / (high_var + 1e-9)
+    low_score = low_contig / (low_var + 1e-9)
+    choice = "bright" if high_score >= low_score else "dark"
+    print(f"  auto polarity (no decisive fiducial ROI): bright class "
+          f"contiguity={high_contig:.2f} var={high_var:.3g}, dark class "
+          f"contiguity={low_contig:.2f} var={low_var:.3g} -> selecting "
+          f"'{choice}'")
+    return choice, (high_cc if choice == "bright" else low_cc)
+
+
+def part_mask(amp, mask_polarity="auto", erosion_px=10, close_px=3,
+             fiducial_roi=None, line_endpoints=None, mask_roi=None,
+             min_area_frac=0.05, max_area_frac=0.95, variance_sigma_px=15):
     """
     Binary mask of the part footprint within the frame.
 
-    Thresholding at a fraction of the bright end of the amplitude
-    distribution separates the part from the cooler background; filling
-    holes closes over the deletion lines themselves; eroding pulls the
-    boundary in from the true part edge so that edge -- which the spatial
-    high-pass otherwise rings against -- doesn't contaminate the interior.
+    The part can read either BRIGHTER or DARKER than its surroundings
+    depending on framing -- a part filling most of a close-framed shot
+    commonly reads darker than the sliver of warm background around it, the
+    opposite of a part imaged from farther back with cool background all
+    around it.  Assuming one polarity is what silently hands every
+    downstream step (phase reference, profiles, statistics) the background
+    instead of the part.
+
+    mask_polarity controls how the part is picked out of a two-class Otsu
+    split of `amp`:
+      'auto' (default) -- decide automatically.  If fiducial_roi is given
+               and falls decisively (>50% coverage) inside one class's
+               largest connected component, that class wins outright -- the
+               user's own chosen reference site is the strongest available
+               signal for which class is the part.  Otherwise falls back to
+               preferring the class that is more spatially CONTIGUOUS (its
+               largest connected component captures most of the class) and
+               has lower large-scale variance (see _choose_polarity()) --
+               printed either way so a bad call is visible in the log, not
+               just downstream.
+      'bright' / 'dark' -- skip auto-detection and force that class, for
+               when auto gets it wrong.
+    mask_roi bypasses thresholding entirely: a polygon -- a list of (x, y)
+               vertices, e.g. from interactive_setup(mask_roi=True) or
+               hand-built and stored in roi_config.json -- that IS the part
+               outline.  Use when the part doesn't separate from the
+               background by brightness at all.
+
+    Whichever way the part class is chosen, close_px first bridges any thin
+    gap in that class -- a deletion line, a scratch, a specular streak --
+    via binary closing (dilate then erode by close_px), so a high-contrast
+    feature crossing the part doesn't split it into two disconnected
+    islands.  Without this, _largest_component() below would silently keep
+    only ONE side of such a divider and drop the other -- which looks
+    identical to a polarity failure from outside (whatever's on the
+    dropped side reads as "not in the mask") but needs a different fix:
+    raising close_px (or, if the divider is very wide/high-contrast,
+    mask_roi) rather than switching mask_polarity.  Sizes typical of a
+    deletion line's own width are covered by the default (3px); a wider
+    divider needs a larger close_px.  Then the largest single connected
+    component is kept (drops stray bright/dark specks elsewhere in frame),
+    holes are filled (closes over whatever of the deletion lines close_px
+    didn't already bridge), and the boundary is eroded inward by
+    erosion_px so the true part edge -- which the spatial high-pass
+    otherwise rings against -- doesn't contaminate the interior.
+
+    Sanity checks, since a masking failure otherwise propagates silently
+    into every downstream number:
+      - fiducial_roi (y0, y1, x0, x1) and every point in line_endpoints (a
+        list of (p0, p1) pairs, each an (x, y) tuple) are checked against
+        the mask BEFORE erosion.  A deletion line legitimately runs busbar
+        to busbar right up to the part's true edge, so checking against
+        the eroded interior would flag correctly-placed endpoints near the
+        edge as errors.  Either falling outside the pre-erosion footprint
+        raises -- naming inverted polarity as the likely cause, but also
+        reporting (when thresholding was used, i.e. mask_roi wasn't
+        passed) the point's own raw Otsu class and that class's raw
+        connected-component size at that point vs. the size of the
+        component actually selected, so a fragmentation failure (fix:
+        close_px or mask_roi) isn't mistaken for a polarity failure (fix:
+        mask_polarity) or vice versa.
+      - the final mask's area is printed as a percentage of the frame on
+        every run, and raises if it's under min_area_frac or over
+        max_area_frac -- an (almost) all-or-nothing mask is symptomatic of
+        exactly this kind of polarity failure, not a real part footprint.
+
+    Returns the final (filled, largest-component, eroded) boolean mask.
     """
-    part = amp > threshold_frac * np.percentile(amp, percentile)
-    return binary_erosion(binary_fill_holes(part), iterations=erosion_px)
+    thresh = high = low = None
+    if mask_roi is not None:
+        raw = _largest_component(binary_fill_holes(_polygon_mask(amp.shape, mask_roi)))
+        source = f"manual ROI polygon ({len(mask_roi)} vertices)"
+    else:
+        try:
+            from skimage.filters import threshold_otsu
+        except ImportError:
+            raise ImportError(
+                "part_mask() needs scikit-image for automatic thresholding "
+                "(pip install scikit-image) -- or pass mask_roi to bypass "
+                "thresholding with a manually clicked polygon"
+            ) from None
+
+        thresh = threshold_otsu(amp)
+        high, low = amp > thresh, amp <= thresh
+        if close_px > 0:
+            high = binary_closing(high, iterations=close_px)
+            low = binary_closing(low, iterations=close_px)
+
+        if mask_polarity == "bright":
+            raw = _largest_component(high)
+            source = f"Otsu threshold {thresh:.4g}, polarity forced 'bright'"
+        elif mask_polarity == "dark":
+            raw = _largest_component(low)
+            source = f"Otsu threshold {thresh:.4g}, polarity forced 'dark'"
+        elif mask_polarity == "auto":
+            choice, raw = _choose_polarity(amp, high, low, fiducial_roi,
+                                           variance_sigma_px)
+            source = f"Otsu threshold {thresh:.4g}, auto-selected polarity '{choice}'"
+        else:
+            raise ValueError(
+                f"mask_polarity must be 'auto', 'bright', or 'dark', got "
+                f"{mask_polarity!r}"
+            )
+        raw = binary_fill_holes(raw)
+
+    fail_hint = ("masking likely failed (inverted polarity is the usual "
+                "cause on a close-framed image) -- try mask_polarity="
+                "'bright'/'dark' explicitly, raise close_px if a line/streak "
+                "may be splitting the part in two, or pass mask_roi to click "
+                "the part outline by hand")
+
+    def _point_diag(x, y):
+        if thresh is None:
+            return ""
+        yi, xi = int(round(y)), int(round(x))
+        if not (0 <= yi < amp.shape[0] and 0 <= xi < amp.shape[1]):
+            return "  (point is outside the frame entirely)"
+        val = float(amp[yi, xi])
+        cls = "bright" if val > thresh else "dark"
+        raw_size = _component_size_at(high if cls == "bright" else low, y, x)
+        sel_size = int(raw.sum())
+        return (f"  (this point has amp={val:.4g}, on the '{cls}' side of the "
+                f"Otsu threshold {thresh:.4g}; its own raw connected "
+                f"component there is {raw_size}px vs. {sel_size}px for the "
+                f"component actually selected -- if raw_size is large but "
+                f"still not selected, it's a polarity mismatch; if it's "
+                f"small, the part is likely fragmented by something thin "
+                f"crossing it, try a larger close_px)")
+
+    if fiducial_roi is not None:
+        y0, y1, x0, x1 = fiducial_roi
+        if not _region_in_mask(raw, y0, y1, x0, x1):
+            cy, cx = (y0 + y1) / 2, (x0 + x1) / 2
+            raise ValueError(
+                f"fiducial ROI y[{y0}:{y1}] x[{x0}:{x1}] is not inside the "
+                f"part mask ({source}) -- {fail_hint}{_point_diag(cx, cy)}"
+            )
+    for i, (p0, p1) in enumerate(line_endpoints or []):
+        for tag, (x, y) in (("p0", p0), ("p1", p1)):
+            if not _point_in_mask(raw, x, y):
+                raise ValueError(
+                    f"line {i} endpoint {tag} at ({x:.0f}, {y:.0f}) is not "
+                    f"inside the part mask ({source}) -- "
+                    f"{fail_hint}{_point_diag(x, y)}"
+                )
+
+    part = binary_erosion(raw, iterations=erosion_px)
+    area_frac = float(part.mean())
+    print(f"  part mask: {source}, area {100 * area_frac:.1f}% of frame "
+          f"(after eroding {erosion_px}px inward)")
+    if area_frac < min_area_frac or area_frac > max_area_frac:
+        raise ValueError(
+            f"part mask covers {100 * area_frac:.1f}% of the frame -- "
+            f"outside the expected [{100 * min_area_frac:.0f}%, "
+            f"{100 * max_area_frac:.0f}%] range -- {fail_hint}"
+        )
+
+    return part
 
 
 def _tls_axis(pts, w):
@@ -1320,7 +1562,7 @@ def slanted_edge_profile(image, p0, p1, half_width_px, bin_px=0.2, n_along=800):
 # 6. GEOMETRY SELECTION (interactive + persisted JSON config)
 # ----------------------------------------------------------------------------
 
-def interactive_setup(image, n_lines=1, calibrate=False):
+def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
     """
     One click-through setup session on a displayed frame -- typically the
     raw lock-in amplitude image, or a single representative raw frame if
@@ -1349,17 +1591,24 @@ def interactive_setup(image, n_lines=1, calibrate=False):
       3. if calibrate=True, two points spanning a KNOWN physical distance,
          prompted for at the console, to compute mm_per_px directly instead
          of hard-coding it.
+      4. if mask_roi=True, a polygon (three or more clicks, Enter to
+         finish, right-click to undo the last point) traced around the
+         part outline by hand -- the manual fallback for part_mask() when
+         its automatic Otsu polarity detection picks the wrong region.
+         Stored in the returned config and reused headlessly by
+         part_mask() on every later run of the same saved config, with no
+         need to re-click.
 
     Each selection is confirmed visually (crosshairs for a line or the
-    calibration pair, a rectangle outline for the ROI) before moving to the
-    next, on the same persistent figure.  Requires an interactive
-    matplotlib backend -- this will not work with Agg / headless.  Returns
-    a plain dict; see save_roi_config() / load_roi_config() to persist it
-    and skip clicking on the next run of the same recording.  Each line is
-    stored as {"p0": [x, y], "p1": [x, y], "angle_deg": ..., "is_reference":
-    bool} -- analyse_deletion_line() recomputes angle_deg itself from p0/p1
-    at analysis time too, so the stored value is for the record, not load-
-    bearing.
+    calibration pair, a rectangle outline for the ROI, a closed polygon for
+    the mask ROI) before moving to the next, on the same persistent figure.
+    Requires an interactive matplotlib backend -- this will not work with
+    Agg / headless.  Returns a plain dict; see save_roi_config() /
+    load_roi_config() to persist it and skip clicking on the next run of
+    the same recording.  Each line is stored as {"p0": [x, y], "p1":
+    [x, y], "angle_deg": ..., "is_reference": bool} -- analyse_deletion_line()
+    recomputes angle_deg itself from p0/p1 at analysis time too, so the
+    stored value is for the record, not load-bearing.
     """
     fig, ax = plt.subplots(figsize=(11, 9))
     ax.imshow(image)
@@ -1417,8 +1666,25 @@ def interactive_setup(image, n_lines=1, calibrate=False):
         print(f"  calibration: {px_dist:.1f} px = {mm_dist:.2f} mm "
               f"-> {mm_per_px:.4f} mm/px")
 
+    mask_roi_pts = None
+    if mask_roi:
+        ax.set_title("part mask ROI: click a polygon around the part outline\n"
+                     "(3+ points, Enter to finish, right-click to undo)")
+        fig.canvas.draw()
+        pts = fig.ginput(-1, timeout=0)
+        if len(pts) < 3:
+            plt.close(fig)
+            raise ValueError(f"mask ROI: need at least 3 clicks for a "
+                            f"polygon, got {len(pts)}")
+        ax.add_patch(Polygon(pts, closed=True, fill=False,
+                             edgecolor="yellow", lw=1.5))
+        fig.canvas.draw()
+        mask_roi_pts = [list(p) for p in pts]
+        print(f"  mask ROI polygon: {len(pts)} vertices")
+
     plt.close(fig)
-    return {"lines": lines, "fiducial_roi": fiducial_roi, "mm_per_px": mm_per_px}
+    return {"lines": lines, "fiducial_roi": fiducial_roi, "mm_per_px": mm_per_px,
+            "mask_roi": mask_roi_pts}
 
 
 def save_roi_config(config, path="roi_config.json"):
@@ -1426,9 +1692,10 @@ def save_roi_config(config, path="roi_config.json"):
     Persist a geometry config (from interactive_setup(), or hand-built with
     the same shape: {"lines": [{"p0": [x, y], "p1": [x, y], "angle_deg":
     ..., "is_reference": bool}, ...], "fiducial_roi": [y0, y1, x0, x1],
-    "mm_per_px": ...}, plus whatever processing parameters analyse() has
-    stamped in -- see its docstring) to JSON, so the next run of the same
-    recording can load it with load_roi_config() instead of clicking again.
+    "mm_per_px": ..., "mask_roi": [[x, y], ...] or None}, plus whatever
+    processing parameters analyse() has stamped in -- see its docstring) to
+    JSON, so the next run of the same recording can load it with
+    load_roi_config() instead of clicking again.
     """
     with open(path, "w") as f:
         json.dump(config, f, indent=2)
@@ -1441,7 +1708,8 @@ def load_roi_config(path="roi_config.json"):
         config = json.load(f)
     print(f"  loaded {path}: {len(config.get('lines', []))} line(s), "
           f"fiducial_roi={config.get('fiducial_roi')}, "
-          f"mm_per_px={config.get('mm_per_px')}")
+          f"mm_per_px={config.get('mm_per_px')}, "
+          f"mask_roi={'set (' + str(len(config['mask_roi'])) + ' vertices)' if config.get('mask_roi') else None}")
     return config
 
 
@@ -1452,7 +1720,7 @@ def load_roi_config(path="roi_config.json"):
 def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
                                     half_width_mm=10.0, bin_px=0.2,
                                     n_along=800, wing_factor=3.0,
-                                    recentre=True):
+                                    baseline_frac=0.6, recentre=True):
     """
     Decompose the sub-pixel cross-line profile of `image` about a deletion
     line into symmetric and antisymmetric parts.
@@ -1520,15 +1788,33 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
     at a typical excitation frequency here, comfortably inside where a
     single zone's own variation should still be small.
 
+    baseline_frac sets where sym's own zero level is measured: the region
+    |d| > baseline_frac * half_width_px (default 0.6, i.e. the outer 40% of
+    the sampled window).  This is deliberately a fraction of the SAMPLING
+    WINDOW (half_width_px), not of wing_factor * mu_px (the diffusion-
+    length-based wing used for peak/wing_rms/ratio/anti_step below): those
+    two can disagree by a lot -- a large wing_factor or a small half_width_mm
+    can shrink wing_factor * mu_px's outer region down to a handful of
+    samples, or past the edge of the window entirely, which previously left
+    the baseline pinned to one single noisy edge sample and sym visibly not
+    settling to zero out in the wings.  Tying the baseline to the window
+    itself instead guarantees a robust multi-sample region regardless of
+    how wing_factor and mu_px happen to relate to half_width_mm.
+
     Returns a dict:
       d           -- offsets from the (possibly recentred) line, >= 0, px
-      sym, anti   -- the two decomposed profiles, same length as d.  sym is
-                     mean-subtracted using its own wing-region level, so a
-                     residual baseline mismatch from imperfect recentring
-                     doesn't bias the reported peak.
+      sym, anti   -- the two decomposed profiles, same length as d.  sym has
+                     the mean of its own baseline region (see baseline_frac
+                     above) subtracted, so it approaches zero out in the
+                     wings and the reported peak is a genuine excess over a
+                     true baseline, not just relative to the window mean.
       p0, p1      -- the (possibly recentred) line endpoints actually used
       centre_shift_px -- how far recentring moved the line (0 if disabled
                      or too few samples were available near the line)
+      baseline_frac, baseline_px, n_baseline_samples -- the baseline region
+                     actually used (baseline_px is the (lo, hi) px range
+                     |d| was required to exceed) and how many samples fell
+                     in it, for reporting.
       peak        -- max of sym within the core region (|d| <= wing_factor
                      * mu_px) -- the candidate leakage signal
       wing_rms    -- RMS of sym in the wings (|d| > wing_factor * mu_px) --
@@ -1587,9 +1873,15 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
     sym = (right + mirrored_left) / 2.0
     anti = (right - mirrored_left) / 2.0
 
-    wing = d > wing_factor * mu_px
-    baseline = float(sym[wing].mean()) if wing.any() else float(sym[-1])
+    baseline_lo = baseline_frac * half_width_px
+    baseline_region = d > baseline_lo
+    if not baseline_region.any():
+        baseline_region = d >= d.max()     # fall back to the outermost sample(s)
+    baseline = float(sym[baseline_region].mean())
     sym = sym - baseline
+    n_baseline_samples = int(baseline_region.sum())
+
+    wing = d > wing_factor * mu_px
 
     # core is d <= threshold and d is sorted ascending from 0, so core is
     # always a PREFIX of the array -- an index into sym[core] is therefore
@@ -1621,15 +1913,18 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
 
     return {
         "d": d, "sym": sym, "anti": anti, "p0": p0, "p1": p1,
-        "centre_shift_px": centre_shift_px, "peak": peak,
-        "wing_rms": wing_rms, "ratio": ratio, "anti_step": anti_step,
+        "centre_shift_px": centre_shift_px,
+        "baseline_frac": baseline_frac, "baseline_px": (baseline_lo, float(d.max())),
+        "n_baseline_samples": n_baseline_samples,
+        "peak": peak, "wing_rms": wing_rms, "ratio": ratio, "anti_step": anti_step,
         "fwhm_mm": fwhm_mm,
     }
 
 
 def analyse_deletion_line(amp, phase, p0, p1, mu_mm, mm_per_px,
                           ply_thickness_mm=3.0, half_width_mm=10.0,
-                          bin_px=0.2, n_along=800, wing_factor=3.0):
+                          bin_px=0.2, n_along=800, wing_factor=3.0,
+                          baseline_frac=0.6):
     """
     Full symmetric/antisymmetric analysis of ONE deletion line.
 
@@ -1658,6 +1953,9 @@ def analyse_deletion_line(amp, phase, p0, p1, mu_mm, mm_per_px,
         not a compact leakage bump.
       - in between: "plausible candidate".
 
+    baseline_frac is passed straight through to symmetric_antisymmetric_profile()
+    for both channels -- see its docstring for what it controls.
+
     Returns {"p0", "p1" (corrected), "mu_px", "angle_deg", "fwhm_mm",
     "verdict", "amp", "phase"}, where "amp" and "phase" are the two
     symmetric_antisymmetric_profile() result dicts.
@@ -1667,11 +1965,12 @@ def analyse_deletion_line(amp, phase, p0, p1, mu_mm, mm_per_px,
     mu_px = mu_mm / mm_per_px
     amp_result = symmetric_antisymmetric_profile(
         amp, p0, p1, mu_px, mm_per_px, half_width_mm=half_width_mm,
-        bin_px=bin_px, n_along=n_along, wing_factor=wing_factor, recentre=True)
+        bin_px=bin_px, n_along=n_along, wing_factor=wing_factor,
+        baseline_frac=baseline_frac, recentre=True)
     phase_result = symmetric_antisymmetric_profile(
         phase, amp_result["p0"], amp_result["p1"], mu_px, mm_per_px,
         half_width_mm=half_width_mm, bin_px=bin_px, n_along=n_along,
-        wing_factor=wing_factor, recentre=False)
+        wing_factor=wing_factor, baseline_frac=baseline_frac, recentre=False)
 
     fwhm_mm = amp_result["fwhm_mm"]
     if np.isnan(fwhm_mm):
@@ -1744,18 +2043,86 @@ def print_line_summary(results, is_reference=None):
 # 8. PIPELINE
 # ----------------------------------------------------------------------------
 
+def _lockin_cache_path(path, fps, f_excite, register, register_upsample,
+                       register_reference, reject_outliers, outlier_mad_threshold):
+    """
+    Deterministic cache file path for (path, loading/registration params).
+    The same inputs always map to the same path, so a repeat run with
+    unchanged loading/registration settings reuses it automatically, and
+    any change to those settings -- or to the source file itself (size,
+    mtime) -- lands on a different path instead of silently reusing stale
+    data.  Geometry/masking/analysis parameters (fiducial ROI, lines,
+    mask_polarity, wing_factor, etc.) are deliberately NOT part of the key:
+    none of those change amp/phase/nf, and keying on them would invalidate
+    the cache on exactly the parameters you're iterating on to fix a
+    masking problem.
+    """
+    st = os.stat(path)
+    key = "|".join(str(v) for v in (
+        os.path.abspath(str(path)), st.st_size, st.st_mtime,
+        fps, f_excite, register, register_upsample, register_reference,
+        reject_outliers, outlier_mad_threshold,
+    ))
+    digest = hashlib.sha1(key.encode()).hexdigest()[:12]
+    return Path(f"{path}.lockin_cache_{digest}.npz")
+
+
 def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
             roi_config_path="roi_config.json", use_saved_config=False,
             register=False, register_upsample=20, register_reference="middle",
             reject_outliers=True, outlier_mad_threshold=8.0,
-            wing_factor=3.0, half_width_mm=10.0, bin_px=0.2, n_along=800,
-            ply_thickness_mm=3.0):
+            use_lockin_cache=True, force_recompute=False,
+            mask_polarity="auto", mask_close_px=3, pick_mask_roi=False,
+            wing_factor=3.0, half_width_mm=4.0, bin_px=0.2, n_along=800,
+            ply_thickness_mm=2.0, baseline_frac=0.6):
     """
     mm_per_px : millimetres per pixel.  None (default) means take it from
                the geometry config instead (either loaded, or measured
                during interactive setup) -- pass a number here to override
                that, or if you're reusing a saved config from before
                calibration was added.
+    use_lockin_cache : cache (amp, phase, nf) -- the output of loading,
+               registration, pre-conditioning, and lock-in, i.e.
+               everything before geometry/masking/analysis -- to a
+               .lockin_cache_<hash>.npz file next to `path` on first run,
+               and reuse it on every later run that passes the SAME path,
+               fps, f_excite, register*, reject_outliers*, and whose
+               source file hasn't changed (see _lockin_cache_path()).
+               Default True.  This is what makes iterating on masking or
+               line geometry fast: those parameters aren't part of the
+               cache key at all, so changing mask_polarity, fiducial_roi,
+               line endpoints, wing_factor, etc. and rerunning skips
+               straight to "geometry setup" instead of re-decoding and
+               re-processing the whole recording.  Safe to leave on --
+               changing anything that DOES affect amp/phase (loading,
+               registration) computes a different cache path rather than
+               reusing a stale one.  Delete the .lockin_cache_*.npz file,
+               or pass force_recompute=True, to force a redo (e.g. after
+               fixing a bug in loading/registration itself).
+    force_recompute : ignore an existing cache and recompute (and
+               overwrite it) even if use_lockin_cache=True.  Default False.
+    mask_polarity : 'auto' (default), 'bright', or 'dark' -- passed
+               straight through to part_mask().  The part can read either
+               brighter OR darker than its surroundings depending on
+               framing (see part_mask()'s docstring); 'auto' detects this,
+               but override it here if auto picks the wrong region.
+    mask_close_px : passed straight through to part_mask() -- how much a
+               thin divider (a deletion line, a scratch) crossing the part
+               gets bridged before picking the largest connected
+               component.  Raise this if the fiducial ROI or a line
+               endpoint is rejected as "not inside the part mask" under
+               BOTH mask_polarity='bright' and 'dark': that pattern means
+               the part is being split into disconnected pieces by
+               something thin, not that the polarity guess is wrong (the
+               error message's diagnostics say which).
+    pick_mask_roi : if True and use_saved_config=False, interactive_setup()
+               also prompts for a manually-clicked polygon around the part
+               outline, used by part_mask() instead of thresholding --
+               the fallback for a part that doesn't separate from the
+               background by brightness at all.  Stored in roi_config.json
+               ("mask_roi") and reused automatically, headlessly, on every
+               later run with use_saved_config=True -- no need to pass this
+               again.
     n_lines : how many deletion lines to click during interactive setup.
                Ignored when use_saved_config=True (the config already says
                how many there are).
@@ -1811,8 +2178,8 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
     reject_outliers : drop frames corrupted by a camera glitch (typically a
                NUC shutter event) before anything else runs (see
                reject_outlier_frames()).  Default True.
-    wing_factor, half_width_mm, bin_px, n_along, ply_thickness_mm : passed
-               straight through to analyse_deletion_line() /
+    wing_factor, half_width_mm, bin_px, n_along, ply_thickness_mm,
+    baseline_frac : passed straight through to analyse_deletion_line() /
                symmetric_antisymmetric_profile() for every line -- see
                their docstrings.  half_width_mm (default 10 mm, roughly 8
                diffusion lengths here) and bin_px (default 0.2 px, the
@@ -1823,7 +2190,10 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                from the line.  ply_thickness_mm (default 3.0) is the glass
                ply thickness the heat source is imaged through -- sets the
                narrow-end physical-plausibility floor (see
-               analyse_deletion_line()'s docstring).
+               analyse_deletion_line()'s docstring).  baseline_frac
+               (default 0.6) sets where sym's own zero level is measured,
+               as a fraction of half_width_mm -- see
+               symmetric_antisymmetric_profile()'s docstring.
 
     fps is ignored for .csq / .seq inputs -- the camera's own per-frame
     timestamps are used instead (see load_csq).
@@ -1834,71 +2204,93 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
     """
     t_start = time.time()
 
-    with _stage("loading"):
-        if str(path).lower().endswith((".csq", ".seq")):
-            frames, t = load_csq(path)
-        else:
-            frames = load_sequence(path)
-            t = build_time_vector(len(frames), fps)
-        print(f"  {frames.shape[0]} frames, {frames.nbytes / 1e6:.0f} MB in memory")
+    cache_file = (_lockin_cache_path(path, fps, f_excite, register, register_upsample,
+                                     register_reference, reject_outliers,
+                                     outlier_mad_threshold)
+                 if use_lockin_cache else None)
+    amp = phase = nf = None
+    if cache_file is not None and not force_recompute and cache_file.exists():
+        try:
+            with np.load(cache_file) as z:
+                amp, phase, nf = z["amp"], z["phase"], float(z["nf"])
+            print(f"  loaded cached lock-in result from {cache_file} -- skipping "
+                  "decode/registration/pre-conditioning/lock-in (delete this file, "
+                  "or pass force_recompute=True, to redo it from raw frames)")
+        except Exception as e:
+            print(f"  WARNING: cache at {cache_file} unreadable ({e}) -- recomputing")
 
-    if reject_outliers:
-        with _stage("checking for corrupted frames"):
-            frames, t = reject_outlier_frames(frames, t,
-                                              mad_threshold=outlier_mad_threshold)
-            detect_frozen_frames(frames, t)
+    if amp is None:
+        with _stage("loading"):
+            if str(path).lower().endswith((".csq", ".seq")):
+                frames, t = load_csq(path)
+            else:
+                frames = load_sequence(path)
+                t = build_time_vector(len(frames), fps)
+            print(f"  {frames.shape[0]} frames, {frames.nbytes / 1e6:.0f} MB in memory")
 
-    if register:
-        with _stage("registering frames"):
-            raw_cy, raw_cx = track_part_centroid(frames)
-            offsets = register_frames(frames, t, f_excite,
-                                      upsample_factor=register_upsample,
-                                      reference=register_reference)
-            reg_cy, reg_cx = track_part_centroid(frames)
+        if reject_outliers:
+            with _stage("checking for corrupted frames"):
+                frames, t = reject_outlier_frames(frames, t,
+                                                  mad_threshold=outlier_mad_threshold)
+                detect_frozen_frames(frames, t)
 
-            figm, axm = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-            axm[0].plot(t, offsets[:, 1], label="dx")
-            axm[0].plot(t, offsets[:, 0], label="dy")
-            axm[0].set_ylabel("registration offset [px]")
-            axm[0].legend(); axm[0].set_title("frame-to-frame registration offset")
-            # Mean-subtracted so "before" and "after" overlay on the same
-            # scale regardless of the part's absolute position in frame.
-            axm[1].plot(t, raw_cx - np.nanmean(raw_cx), label="cx, before")
-            axm[1].plot(t, reg_cx - np.nanmean(reg_cx), label="cx, after")
-            axm[1].plot(t, raw_cy - np.nanmean(raw_cy), label="cy, before", ls="--")
-            axm[1].plot(t, reg_cy - np.nanmean(reg_cy), label="cy, after", ls="--")
-            axm[1].set_xlabel("time [s]")
-            axm[1].set_ylabel("part centroid, mean-subtracted [px]")
-            axm[1].legend(fontsize=8, ncol=2)
-            axm[1].set_title("part centroid vs time -- independent motion check")
-            figm.tight_layout()
-            figm.savefig("lockin_motion.png", dpi=150)
-            plt.close(figm)
+        if register:
+            with _stage("registering frames"):
+                raw_cy, raw_cx = track_part_centroid(frames)
+                offsets = register_frames(frames, t, f_excite,
+                                          upsample_factor=register_upsample,
+                                          reference=register_reference)
+                reg_cy, reg_cx = track_part_centroid(frames)
 
-    with _stage("pre-conditioning"):
-        frames, t = decimate(frames, t, target_fps=max(8 * f_excite, 1.0))
-        frames = remove_global_offsets(frames)
-        frames = detrend_per_pixel(frames, t)
-        frames, t = trim_to_whole_cycles(frames, t, f_excite)
+                figm, axm = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+                axm[0].plot(t, offsets[:, 1], label="dx")
+                axm[0].plot(t, offsets[:, 0], label="dy")
+                axm[0].set_ylabel("registration offset [px]")
+                axm[0].legend(); axm[0].set_title("frame-to-frame registration offset")
+                # Mean-subtracted so "before" and "after" overlay on the same
+                # scale regardless of the part's absolute position in frame.
+                axm[1].plot(t, raw_cx - np.nanmean(raw_cx), label="cx, before")
+                axm[1].plot(t, reg_cx - np.nanmean(reg_cx), label="cx, after")
+                axm[1].plot(t, raw_cy - np.nanmean(raw_cy), label="cy, before", ls="--")
+                axm[1].plot(t, reg_cy - np.nanmean(reg_cy), label="cy, after", ls="--")
+                axm[1].set_xlabel("time [s]")
+                axm[1].set_ylabel("part centroid, mean-subtracted [px]")
+                axm[1].legend(fontsize=8, ncol=2)
+                axm[1].set_title("part centroid vs time -- independent motion check")
+                figm.tight_layout()
+                figm.savefig("lockin_motion.png", dpi=150)
+                plt.close(figm)
 
-    with _stage("lock-in"):
-        amp, phase = lockin(frames, t, f_excite)
-        nf = noise_floor(frames, t, f_excite)
-        print(f"  noise floor (off-frequency amplitude): {nf:.4g}")
-        print(f"  peak amplitude / noise floor: {amp.max() / nf:.1f}")
+        with _stage("pre-conditioning"):
+            frames, t = decimate(frames, t, target_fps=max(8 * f_excite, 1.0))
+            frames = remove_global_offsets(frames)
+            frames = detrend_per_pixel(frames, t)
+            frames, t = trim_to_whole_cycles(frames, t, f_excite)
 
-        # 2f check: strong 2f with weak f means the excitation was amplitude
-        # modulated rather than switched on/off, so power varied at twice the rate.
-        amp2f, _ = lockin(frames, t, 2 * f_excite)
-        print(f"  median amplitude at 2f / at f: {np.median(amp2f) / np.median(amp):.2f}"
-              "   (should be well under 1)")
+        with _stage("lock-in"):
+            amp, phase = lockin(frames, t, f_excite)
+            nf = noise_floor(frames, t, f_excite)
+            print(f"  noise floor (off-frequency amplitude): {nf:.4g}")
+            print(f"  peak amplitude / noise floor: {amp.max() / nf:.1f}")
+
+            # 2f check: strong 2f with weak f means the excitation was amplitude
+            # modulated rather than switched on/off, so power varied at twice the rate.
+            amp2f, _ = lockin(frames, t, 2 * f_excite)
+            print(f"  median amplitude at 2f / at f: {np.median(amp2f) / np.median(amp):.2f}"
+                  "   (should be well under 1)")
+
+        if cache_file is not None:
+            np.savez_compressed(cache_file, amp=amp, phase=phase, nf=np.asarray(nf))
+            print(f"  cached lock-in result to {cache_file} -- reruns with the same "
+                  "loading/registration settings will reuse it (see use_lockin_cache)")
 
     with _stage("geometry setup"):
         if use_saved_config:
             roi_config = load_roi_config(roi_config_path)
         else:
             roi_config = interactive_setup(amp, n_lines=n_lines,
-                                           calibrate=(mm_per_px is None))
+                                           calibrate=(mm_per_px is None),
+                                           mask_roi=pick_mask_roi)
 
         if mm_per_px is None:
             mm_per_px = roi_config.get("mm_per_px")
@@ -1928,7 +2320,8 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         current_params = {
             "mm_per_px": mm_per_px, "half_width_mm": half_width_mm,
             "bin_px": bin_px, "n_along": n_along, "f_excite": f_excite,
-            "ply_thickness_mm": ply_thickness_mm,
+            "ply_thickness_mm": ply_thickness_mm, "baseline_frac": baseline_frac,
+            "mask_polarity": mask_polarity,
         }
         stored_params = roi_config.get("processing_params")
         if stored_params:
@@ -1970,7 +2363,9 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         alpha = 5e-7                                    # m^2/s, glass
         mu_mm = np.sqrt(alpha / (np.pi * f_excite)) * 1000
         print(f"  diffusion length: {mu_mm:.2f} mm")
-        part = part_mask(amp)
+        part = part_mask(amp, mask_polarity=mask_polarity, close_px=mask_close_px,
+                         fiducial_roi=fiducial_roi, line_endpoints=lines_geom,
+                         mask_roi=roi_config.get("mask_roi"))
 
         # Stamped on every figure below -- different window widths etc.
         # across runs make figures incomparable at a glance otherwise.
@@ -1993,6 +2388,10 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
 
         fig, ax = plt.subplots(1, 3, figsize=(16, 5))
         im0 = ax[0].imshow(amp);     ax[0].set_title("amplitude (raw)")
+        # Mask outline on the raw panel so a bad mask (wrong polarity, wrong
+        # region) is visible at a glance instead of inferred from downstream
+        # plots -- see part_mask()'s docstring on why polarity isn't assumed.
+        ax[0].contour(part.astype(float), levels=[0.5], colors="red", linewidths=1.2)
         im1 = ax[1].imshow(disp, vmin=lo, vmax=hi)
         ax[1].set_title("amplitude (masked)")
         im2 = ax[2].imshow(phase_deg, cmap="twilight", vmin=lo_p, vmax=hi_p)
@@ -2022,12 +2421,18 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                                         ply_thickness_mm=ply_thickness_mm,
                                         half_width_mm=half_width_mm,
                                         bin_px=bin_px, n_along=n_along,
-                                        wing_factor=wing_factor)
+                                        wing_factor=wing_factor,
+                                        baseline_frac=baseline_frac)
             results.append(res)
             a = res["amp"]
+            shift_mm = a["centre_shift_px"] * mm_per_px
+            baseline_lo_mm, baseline_hi_mm = (v * mm_per_px for v in a["baseline_px"])
             ref_note = "  [reference]" if is_reference[i] else ""
             print(f"  line {i} ({res['angle_deg']:.1f} deg){ref_note}: "
-                  f"centre shift {a['centre_shift_px']:+.2f} px, "
+                  f"centre shift {a['centre_shift_px']:+.2f} px "
+                  f"({shift_mm:+.3f} mm) from clicked position, "
+                  f"baseline region |d| in [{baseline_lo_mm:.1f}, "
+                  f"{baseline_hi_mm:.1f}] mm ({a['n_baseline_samples']} samples), "
                   f"sym peak {a['peak']:.4g}, wing RMS {a['wing_rms']:.4g}, "
                   f"ratio {a['ratio']:.2f}, width {res['fwhm_mm']:.2f} mm "
                   f"-- {res['verdict']}")
@@ -2035,16 +2440,32 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         n = len(results)
         fig2, ax2 = plt.subplots(n, 2, figsize=(13, 4 * n), squeeze=False)
         for i, res in enumerate(results):
+            shift_mm = res["amp"]["centre_shift_px"] * mm_per_px
             for col, (label, r, scale) in enumerate((
                     ("amplitude", res["amp"], 1.0),
                     ("phase [deg]", res["phase"], 180.0 / np.pi))):
                 a = ax2[i][col]
-                d_mm = r["d"] * mm_per_px
-                a.axvspan(0, mu_mm, alpha=0.15, color="tab:blue",
+                # Plot the FULL -half_width..+half_width range: d/sym/anti
+                # are one-sided by construction (see
+                # symmetric_antisymmetric_profile()), so the other half is
+                # reconstructed here via their own defined symmetry -- sym
+                # mirrored as-is (even about the centre), anti mirrored with
+                # a sign flip (odd about the centre).  This is intentionally
+                # redundant (sym/anti are symmetric/antisymmetric by
+                # construction, so the mirror is exact) -- it's the visual
+                # check that the vertical "located centre" marker below
+                # actually sits where the decomposition was centred, not
+                # proof the decomposition itself is unbiased.
+                d_mm = np.concatenate([-r["d"][1:][::-1], r["d"]]) * mm_per_px
+                sym_full = np.concatenate([r["sym"][1:][::-1], r["sym"]]) * scale
+                anti_full = np.concatenate([-r["anti"][1:][::-1], r["anti"]]) * scale
+                a.axvspan(-mu_mm, mu_mm, alpha=0.15, color="tab:blue",
                          label=f"diffusion length ({mu_mm:.1f} mm)")
                 a.axhline(0, lw=0.5, color="k")
-                a.plot(d_mm, r["sym"] * scale, label="sym (candidate defect)")
-                a.plot(d_mm, r["anti"] * scale, label="anti (zone step)")
+                a.axvline(0, lw=1.2, ls="--", color="tab:red",
+                         label=f"located centre ({shift_mm:+.3f} mm from click)")
+                a.plot(d_mm, sym_full, label="sym (candidate defect)")
+                a.plot(d_mm, anti_full, label="anti (zone step)")
                 a.set_xlabel("distance from line centre [mm]")
                 a.set_ylabel(label)
                 ref_tag = " [reference]" if is_reference[i] else ""
@@ -2131,7 +2552,7 @@ if __name__ == "__main__":
     # use_saved_config=True to reload that JSON and skip clicking entirely
     # -- this also works headless (no display needed at all).
     analyse(
-        path="FLIR0022.csq",
+        path="FLIR0023.csq",
         fps=30.0,
         f_excite=0.1,
         n_lines=1,                 # how many deletion lines to click
@@ -2146,7 +2567,23 @@ if __name__ == "__main__":
         # analyse()'s docstring for why it's off by default here (a
         # low-CTE glass laminate isn't expected to move enough for
         # registration to help, and it can occasionally hurt).
-        ply_thickness_mm=3.0,      # the glass ply the source is imaged
+        # use_lockin_cache=True (the default) -- decode/registration/
+        # lock-in are cached to a .lockin_cache_<hash>.npz next to the
+        # .csq on first run and reused on every later run with the same
+        # path/fps/f_excite/register* settings, so iterating on
+        # mask_polarity, fiducial_roi, line geometry etc. below is fast
+        # (no re-decode).  Delete that file, or pass force_recompute=True,
+        # after fixing anything upstream of lock-in.
+        mask_polarity="auto",      # 'auto' / 'bright' / 'dark' -- override
+                                   # here (not by editing analyse()'s
+                                   # default) if auto picks the wrong region
+        mask_close_px=3,           # raise this if the fiducial ROI / a line
+                                   # endpoint is rejected under BOTH 'bright'
+                                   # and 'dark' -- that pattern means a line
+                                   # or streak is splitting the part into two
+                                   # disconnected pieces, not a polarity
+                                   # mismatch (see part_mask()'s docstring)
+        ply_thickness_mm=2.0,      # the glass ply the source is imaged
                                    # through -- sets the narrow-end
                                    # physical-plausibility floor
         half_width_mm=10.0,        # cross-line window, ~8 diffusion

@@ -1,0 +1,2 @@
+0022 is test @ ambient, 115v, 0.1hz
+0023 starts around 100F, 75v, 0.1hz, a little closer to the part

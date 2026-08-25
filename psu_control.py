@@ -7,7 +7,7 @@ CYCLES = 20
 
 # --- carrier (fast) — what the heater actually runs on ---
 F_LINE = 400.0         # Hz
-V_OP   = 115.0
+V_OP   = 75
 I_LIM  = 20.0          # A — set above expected draw, below anything alarming
 
 PERIOD = 1.0 / F_MOD
