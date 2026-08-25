@@ -6,7 +6,18 @@
       "Bash(/c/projects/lockin/.venv/Scripts/python.exe -m py_compile /c/projects/lockin/psu_control.py)",
       "PowerShell(Test-Connection -ComputerName 192.168.1.11 -Count 2 -Quiet; echo \"--- VXI-11 portmapper \\(111\\) ---\"; \\(Test-NetConnection -ComputerName 192.168.1.11 -Port 111 -WarningAction SilentlyContinue\\).TcpTestSucceeded; echo \"--- SCPI raw \\(5025\\) ---\"; \\(Test-NetConnection -ComputerName 192.168.1.11 -Port 5025 -WarningAction SilentlyContinue\\).TcpTestSucceeded)",
       "Bash(/c/projects/lockin/.venv/Scripts/python.exe -c ' *)",
-      "PowerShell(Get-PnpDevice | Where-Object { $_.FriendlyName -match 'USB Test|TMC|0A69|0883' -or $_.InstanceId -match '0A69' } | Select-Object FriendlyName, Status, Class, InstanceId | Format-List | Out-String)"
+      "PowerShell(Get-PnpDevice | Where-Object { $_.FriendlyName -match 'USB Test|TMC|0A69|0883' -or $_.InstanceId -match '0A69' } | Select-Object FriendlyName, Status, Class, InstanceId | Format-List | Out-String)",
+      "PowerShell(python test_find_line.py)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe test_find_line.py)",
+      "Bash(./.venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('lockin_thermography.py', encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(./.venv/Scripts/python.exe test_frozen_frames.py)",
+      "Bash(./.venv/Scripts/python.exe test_pipeline_smoke.py)",
+      "Bash(./.venv/Scripts/python.exe test_sym_anti.py)",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe test_roi_config.py)",
+      "Bash(rm -f /c/Users/peter.porcaro/projects/lockin/_smoke2.npy /c/Users/peter.porcaro/projects/lockin/_roi2.json /c/Users/peter.porcaro/projects/lockin/lockin_images.png.bak)",
+      "Bash(rm -f _smoke2.npy _roi2.json)",
+      "Bash(./.venv/Scripts/python.exe -c \"import py_compile; py_compile.compile\\('lockin_thermography.py', doraise=True\\)\")"
     ]
   }
 }
