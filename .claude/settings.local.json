@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/projects/lockin/.venv/Scripts/python.exe -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(/c/projects/lockin/.venv/Scripts/python.exe -c \"import pyvisa; print\\('pyvisa', pyvisa.__version__\\)\")",
+      "Bash(/c/projects/lockin/.venv/Scripts/python.exe -m py_compile /c/projects/lockin/psu_control.py)",
+      "PowerShell(Test-Connection -ComputerName 192.168.1.11 -Count 2 -Quiet; echo \"--- VXI-11 portmapper \\(111\\) ---\"; \\(Test-NetConnection -ComputerName 192.168.1.11 -Port 111 -WarningAction SilentlyContinue\\).TcpTestSucceeded; echo \"--- SCPI raw \\(5025\\) ---\"; \\(Test-NetConnection -ComputerName 192.168.1.11 -Port 5025 -WarningAction SilentlyContinue\\).TcpTestSucceeded)",
+      "Bash(/c/projects/lockin/.venv/Scripts/python.exe -c ' *)",
+      "PowerShell(Get-PnpDevice | Where-Object { $_.FriendlyName -match 'USB Test|TMC|0A69|0883' -or $_.InstanceId -match '0A69' } | Select-Object FriendlyName, Status, Class, InstanceId | Format-List | Out-String)"
+    ]
+  }
+}
