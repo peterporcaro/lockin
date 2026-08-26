@@ -2,3 +2,4 @@
 *.csq
 roi_config.json
 .claude/
+*.npz
