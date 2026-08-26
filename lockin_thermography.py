@@ -809,92 +809,6 @@ def _choose_polarity(amp, high, low, fiducial_roi, variance_sigma_px):
     return choice, (high_cc if choice == "bright" else low_cc)
 
 
-def _phase_display_mask(amp, phase, part, nf, span_target_deg=60.0,
-                        k_values=(1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0,
-                                 7.0, 8.0, 9.0, 10.0, 12.0, 15.0, 20.0,
-                                 25.0, 30.0, 40.0, 50.0),
-                        min_px=50):
-    """
-    Find the loosest amplitude/noise-floor threshold above which the part's
-    phase is tightly enough concentrated to display without a wraparound
-    seam, and return (mask, k_used, circ_ref, achieved_span_deg).
-
-    part_mask() is a brightness/geometry mask -- it says a pixel is inside
-    the part's footprint, not that its phase there is trustworthy.
-    Amplitude and phase both degrade TOGETHER with distance from wherever
-    the excitation actually couples into the coating: amplitude decays
-    (at the diffusion-length scale -- the same physical picture behind
-    wing_factor * mu_mm elsewhere in this file), and a thermal wave's phase
-    lag genuinely keeps growing with propagation distance, in principle
-    without bound -- well past +-180 degrees on a part whose extent
-    reaches many diffusion lengths from the excitation. So the region
-    where phase legitimately varies by more than a wrap IS, physically,
-    close to the same region where amplitude has already decayed toward
-    the noise floor; the two aren't separable, and there is no single
-    branch-cut placement, nor any denoising, that recovers a trustworthy
-    phase value out there. Confirmed directly on real data: Gaussian-
-    smoothing the phase's complex representation (exp(1j*phase), the
-    correct way to average a circular quantity) from sigma=0 out to
-    sigma=8 px changed the masked part's circular concentration by under
-    3% -- ruling out ordinary per-pixel noise as the cause, since that
-    would average out under smoothing, and pointing at a genuine, spatially
-    real, wide phase spread instead. Sweeping the amplitude threshold
-    instead is what actually works: from 1x to 9x the noise floor the
-    2-98th-percentile spread of the recentred phase sat above 180 degrees
-    at every step, then dropped to under 10 degrees at 10x -- a one-step
-    cliff, not a gradual improvement, consistent with "close to the
-    source" vs. "everywhere else" rather than a continuum.
-
-    Because that boundary reflects THIS recording's excitation geometry
-    (how much of the imaged part is actually within a few diffusion
-    lengths of where power couples in), not a fixed constant, it's found
-    here empirically rather than hard-coded, the same way this file finds
-    other physically-set boundaries from the data instead of a pixel
-    count: try increasing k, and for each candidate, recentre the
-    surviving population around its own circular mean (see analyse()'s
-    "rendering diagnostic images" stage for why recentring ALONE, without
-    this floor, isn't enough -- a genuinely far-from-source population
-    isn't just off-centre, it's spread across a real physical range) and
-    measure the resulting spread; return the first (smallest, so the
-    display keeps as much of the part as it safely can) k whose spread
-    clears span_target_deg. Stops early if a threshold would leave fewer
-    than min_px pixels (too sparse to say anything about, let alone
-    display). Expect the chosen k -- and how much of the part survives it
-    -- to vary a lot between recordings: a small part imaged close to its
-    excitation can keep nearly all of it, while a part imaged well beyond
-    a few diffusion lengths from its excitation may only be trustworthy
-    near that source, exactly like the per-line wing/core split elsewhere
-    in this file.
-
-    Returns (part, None, ref_over_whole_part, whatever_spread_that_was) if
-    even the loosest threshold tried never gets under span_target_deg
-    (nothing to mask by, so the caller displays everything, unmasked
-    further, and should treat the returned spread as a "still this bad"
-    warning) -- and the SAME shape one level tighter (mask, k, ref, span)
-    if some threshold worked but not the very first one tried.
-    """
-    fallback = None
-    for k in k_values:
-        m = part & (amp > k * nf)
-        if int(m.sum()) < min_px:
-            break
-        ph_m = phase[m]
-        ref = float(np.angle(np.mean(np.exp(1j * ph_m))))
-        rec_deg = np.degrees(np.angle(np.exp(1j * (ph_m - ref))))
-        span = float(np.percentile(rec_deg, 98) - np.percentile(rec_deg, 2))
-        fallback = (m, k, ref, span)
-        if span <= span_target_deg:
-            return fallback
-    if fallback is not None:
-        return fallback
-    part_phase = phase[part]
-    ref = (float(np.angle(np.mean(np.exp(1j * part_phase))))
-          if part_phase.size else 0.0)
-    rec_deg = np.degrees(np.angle(np.exp(1j * (part_phase - ref)))) if part_phase.size else np.array([0.0])
-    span = float(np.percentile(rec_deg, 98) - np.percentile(rec_deg, 2))
-    return part, None, ref, span
-
-
 def part_mask(amp, mask_polarity="auto", erosion_px=10, close_px=3,
              fiducial_roi=None, line_endpoints=None, mask_roi=None,
              min_area_frac=0.05, max_area_frac=0.95, variance_sigma_px=15):
@@ -1059,6 +973,141 @@ def part_mask(amp, mask_polarity="auto", erosion_px=10, close_px=3,
         )
 
     return part
+
+
+def reference_phase(phase, part, fiducial_roi=None, method="circular_mean",
+                    wrap_warn_deg=20.0, wrap_warn_frac=0.03):
+    """
+    Rotate `phase` (radians, on lockin()'s native arctan2 range (-pi, pi])
+    so its branch cut lands away from the bulk of the masked part, and
+    return (phase_referenced, ref_rad, wrap_frac).
+
+    method:
+      'circular_mean' (default) -- reference to the circular mean of every
+               masked (`part`) pixel's phase:
+                   ref = angle(mean(exp(1j * phase[part])))
+                   phase = angle(exp(1j * (phase - ref)))
+               lockin()'s phase is wrapped to (-180, +180] with an
+               essentially arbitrary branch-cut location -- wherever
+               arctan2 happens to flip sign.  Referencing to a SINGLE site
+               (the previous default: the fiducial ROI's median) has no way
+               to know whether that site's own phase happens to sit near
+               that cut; if it does, subtracting it rotates the cut
+               straight into the middle of the part instead of away from
+               it, and everything on one side of some arbitrary line reads
+               close to +180 while everything just across it reads close to
+               -180 -- a real part reading as two, discontinuous halves,
+               even though nothing about the underlying phase is
+               physically unstable there. The circular mean of the WHOLE
+               masked population is the phasor sum's own direction, i.e.
+               by construction it points at wherever the population is
+               most concentrated -- referencing to it puts the bulk of the
+               distribution at 0 and pushes the branch cut out to
+               wherever the population is thinnest, which is the best any
+               single global rotation can do.
+      'fiducial_roi' -- the previous behaviour: reference to the median
+               phase within `fiducial_roi` (y0, y1, x0, x1).  Still useful
+               when the fiducial site is deliberately meant to be the
+               profiles' physical zero, but carries the branch-cut risk
+               above; interactive_setup() checks a candidate ROI against
+               this same risk before accepting the click (see its
+               docstring) specifically because of it.
+
+    After referencing, reports the fraction of masked pixels within
+    wrap_warn_deg of +/-180 and warns if it exceeds wrap_warn_frac (a few
+    percent, default 3%): if referencing genuinely centred the bulk of the
+    distribution, that fraction should be small regardless of which method
+    was used.  A large residual means either the part's phase genuinely
+    spans more than a full turn (real thermal-wave phase lag CAN do this
+    far enough from the excitation source -- see unwrap_phase_field()), or
+    `part` includes pixels whose phase is noise-dominated (near-random, so
+    some land near the cut no matter where it's rotated to).  Either way,
+    phase images/profiles should not be trusted without investigating
+    further when this fires.
+
+    Returns phase_referenced (radians, still wrapped to (-pi, pi]),
+    ref_rad (the rotation applied), and wrap_frac (the diagnostic above).
+    """
+    if method == "circular_mean":
+        if not part.any():
+            raise ValueError("reference_phase(): part mask is empty")
+        ref = float(np.angle(np.mean(np.exp(1j * phase[part]))))
+    elif method == "fiducial_roi":
+        if fiducial_roi is None:
+            raise ValueError("reference_phase(): method='fiducial_roi' needs fiducial_roi")
+        y0, y1, x0, x1 = fiducial_roi
+        roi = phase[y0:y1, x0:x1]
+        if roi.size == 0:
+            raise ValueError(
+                f"fiducial_roi {fiducial_roi} is empty -- it must be "
+                "(y0, y1, x0, x1) with y0 < y1 and x0 < x1"
+            )
+        ref = float(np.median(roi))
+    else:
+        raise ValueError(
+            f"method must be 'circular_mean' or 'fiducial_roi', got {method!r}"
+        )
+
+    phase_ref = np.angle(np.exp(1j * (phase - ref)))
+    print(f"  phase referenced to {method} ({np.degrees(ref):.1f} deg)")
+
+    if part.any():
+        near_cut = np.abs(np.abs(np.degrees(phase_ref[part])) - 180.0) < wrap_warn_deg
+        wrap_frac = float(near_cut.mean())
+    else:
+        wrap_frac = 0.0
+    if wrap_frac > wrap_warn_frac:
+        print(f"  WARNING: {100 * wrap_frac:.1f}% of masked pixels are "
+              f"within {wrap_warn_deg:.0f} deg of the +/-180 branch cut "
+              "after referencing -- the phase field likely spans more than "
+              "a full turn somewhere in the part; phase images/profiles "
+              "should not be trusted as-is (consider unwrap_phase=True, or "
+              "check that `part` isn't including noise-dominated pixels)")
+
+    return phase_ref, ref, wrap_frac
+
+
+def unwrap_phase_field(phase, part):
+    """
+    2D spatial phase unwrapping (skimage.restoration.unwrap_phase) over the
+    masked region, for when reference_phase()'s wrap-fraction warning fires
+    and a genuine multi-turn phase spread remains after referencing.
+
+    reference_phase() only rotates WHERE the branch cut sits; it cannot
+    remove a real wrap, because a real wrap is the phase actually crossing
+    a full 2*pi somewhere in the field (see reference_phase()'s docstring
+    on why phase lag can genuinely grow past +-180 deg far enough from the
+    excitation source).  This instead integrates the phase gradient across
+    the masked region and adds back whichever multiple of 2*pi makes the
+    result spatially continuous, the standard 2D unwrapping approach.
+
+    Only `part` pixels are unwrapped -- passed to skimage as a masked
+    array so background noise phase (already established, in part_mask()
+    and reference_phase()'s own docstrings, to carry no reliable
+    coherent-frequency signal) can't corrupt the unwrapping of the part
+    itself.  Pixels outside `part` are returned unchanged (still wrapped,
+    and not meant to be read).
+
+    Returns an array the same shape as `phase`, in radians -- values
+    inside `part` are NOT wrapped to (-pi, pi]; that's the point, an
+    unwrapped field is exactly the one place a value outside that range is
+    meaningful rather than a bug. Both the phase display panel and the
+    per-line profile extraction downstream can use this array directly in
+    place of the still-wrapped `phase`.
+    """
+    try:
+        from skimage.restoration import unwrap_phase
+    except ImportError:
+        raise ImportError(
+            "unwrap_phase_field() needs scikit-image "
+            "(pip install scikit-image)"
+        ) from None
+
+    masked = np.ma.masked_array(phase, mask=~part)
+    unwrapped = unwrap_phase(masked)
+    out = phase.copy()
+    out[part] = np.ma.getdata(unwrapped)[part]
+    return out
 
 
 def _tls_axis(pts, w):
@@ -1648,15 +1697,16 @@ def slanted_edge_profile(image, p0, p1, half_width_px, bin_px=0.2, n_along=800):
 # 6. GEOMETRY SELECTION (interactive + persisted JSON config)
 # ----------------------------------------------------------------------------
 
-def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
+def interactive_setup(image, phase=None, n_lines=1, calibrate=False,
+                      mask_roi=False, wrap_reject_deg=20.0):
     """
     One click-through setup session on a displayed frame -- typically the
     raw lock-in amplitude image, or a single representative raw frame if
     amplitude isn't computed yet -- that defines every piece of geometry
     this pipeline needs by hand.  Used by analyse() when auto_geometry=False
-    (or via automatic fallback logic left to the caller): the manual
-    alternative to auto_setup() for a part where the true signal is a
-    subtle symmetric bump riding on top of a much bigger, genuine
+    (the default -- see analyse()'s docstring for why manual is preferred
+    here): the alternative to auto_setup() for a part where the true signal
+    is a subtle symmetric bump riding on top of a much bigger, genuine
     zone-to-zone step, and auto_setup()'s detector -- built around "big and
     sharp" -- has locked onto the step instead (check
     lockin_line_candidates.png to tell).
@@ -1675,8 +1725,16 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
          carries the zone step this whole feature exists to separate out,
          and an edge is where motion artefacts and emissivity variation are
          worst (see auto_fiducial_roi()'s docstring -- analyse() places the
-         ROI this way automatically by default; click it by hand here only
-         when overriding that with auto_geometry=False).
+         ROI this way automatically when auto_geometry=True; click it by
+         hand here otherwise).  If `phase` was passed, the pick is also
+         checked against the raw (unreferenced) phase in that ROI: a
+         candidate whose median phase sits within wrap_reject_deg of the
+         +/-180 branch cut is REJECTED with an explanation printed, and you
+         are prompted to click again -- referencing to (or near) a site
+         sitting on the branch cut is exactly what previously put the cut
+         through the middle of the part (see reference_phase()'s
+         docstring). This check is about the ROI SITE, independent of
+         which reference method analyse() ends up using.
       3. if calibrate=True, two points spanning a KNOWN physical distance,
          prompted for at the console, to compute mm_per_px directly instead
          of hard-coding it.
@@ -1687,6 +1745,14 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
          Stored in the returned config and reused headlessly by
          part_mask() on every later run of the same saved config, with no
          need to re-click.
+
+    `phase` (radians, same shape as `image`) is optional -- when given, it's
+    shown in its own panel alongside `image` (percentile-scaled, same
+    "twilight" cyclic colormap analyse() uses for its own phase panel) so a
+    wrap boundary is visible before you click, not just discovered after
+    the fact from the rejection message.  Every click still targets the
+    SAME pixel coordinates regardless of which panel it lands in -- both
+    panels show the same (h, w) array, just two different views of it.
 
     Each selection is confirmed visually (crosshairs for a line or the
     calibration pair, a rectangle outline for the ROI, a closed polygon for
@@ -1699,7 +1765,14 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
     recomputes angle_deg itself from p0/p1 at analysis time too, so the
     stored value is for the record, not load-bearing.
     """
-    fig, ax = plt.subplots(figsize=(11, 9))
+    if phase is not None:
+        fig, (ax, axp) = plt.subplots(1, 2, figsize=(18, 9))
+        lo_p, hi_p = np.nanpercentile(np.degrees(phase), [2, 98])
+        axp.imshow(np.degrees(phase), cmap="twilight", vmin=lo_p, vmax=hi_p)
+        axp.set_title("phase [deg] (raw, unreferenced) -- for reference only, "
+                      "click on the LEFT image")
+    else:
+        fig, ax = plt.subplots(figsize=(11, 9))
     ax.imshow(image)
 
     lines = []
@@ -1721,20 +1794,41 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
         lines.append({"p0": list(p0), "p1": list(p1), "angle_deg": angle_deg,
                      "is_reference": is_reference})
 
-    ax.set_title("fiducial ROI: click two opposite corners\n"
+    base_title = ("fiducial ROI: click two opposite corners\n"
                  "(clean mid-zone coating -- away from every line and the edge)")
-    fig.canvas.draw()
-    pts = fig.ginput(2, timeout=0)
-    if len(pts) != 2:
-        plt.close(fig)
-        raise ValueError(f"fiducial ROI: need exactly two clicks, got {len(pts)}")
-    (rx0, ry0), (rx1, ry1) = pts
-    x0, x1 = sorted((rx0, rx1))
-    y0, y1 = sorted((ry0, ry1))
-    ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
-                           edgecolor="lime", lw=1.5))
-    fig.canvas.draw()
-    fiducial_roi = [int(round(y0)), int(round(y1)), int(round(x0)), int(round(x1))]
+    ax.set_title(base_title)
+    while True:
+        fig.canvas.draw()
+        pts = fig.ginput(2, timeout=0)
+        if len(pts) != 2:
+            plt.close(fig)
+            raise ValueError(f"fiducial ROI: need exactly two clicks, got {len(pts)}")
+        (rx0, ry0), (rx1, ry1) = pts
+        x0, x1 = sorted((rx0, rx1))
+        y0, y1 = sorted((ry0, ry1))
+        fiducial_roi = [int(round(y0)), int(round(y1)), int(round(x0)), int(round(x1))]
+
+        if phase is not None:
+            roi_deg = np.degrees(phase[fiducial_roi[0]:fiducial_roi[1],
+                                       fiducial_roi[2]:fiducial_roi[3]])
+            if roi_deg.size:
+                median_deg = float(np.median(roi_deg))
+                dist_to_cut = 180.0 - abs(median_deg)   # distance to the
+                                                         # nearer of +/-180
+                if dist_to_cut < wrap_reject_deg:
+                    print(f"  REJECTED: this ROI's median raw phase "
+                          f"({median_deg:.1f} deg) is within "
+                          f"{wrap_reject_deg:.0f} deg of the +/-180 wrap "
+                          "boundary -- referencing to (or near) this site "
+                          "would put the branch cut through the middle of "
+                          "the part (see reference_phase()'s docstring). "
+                          "Click a different spot.")
+                    continue
+
+        ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False,
+                               edgecolor="lime", lw=1.5))
+        fig.canvas.draw()
+        break
     print(f"  fiducial ROI: y[{fiducial_roi[0]}:{fiducial_roi[1]}] "
           f"x[{fiducial_roi[2]}:{fiducial_roi[3]}]")
 
@@ -1944,7 +2038,8 @@ def load_roi_config(path="roi_config.json"):
 def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
                                     half_width_mm=10.0, bin_px=0.2,
                                     n_along=800, wing_factor=3.0,
-                                    baseline_frac=0.6, recentre=True):
+                                    baseline_frac=0.6, recentre=True,
+                                    max_shift_mm=1.5, detrend_profile=True):
     """
     Decompose the sub-pixel cross-line profile of `image` about a deletion
     line into symmetric and antisymmetric parts.
@@ -2000,6 +2095,44 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
     not iterated to convergence, per the physical picture that a single
     clean step has one well-defined location.
 
+    max_shift_mm (default 1.5) clamps how far that steepest-point search is
+    even allowed to look, converted to px via mm_per_px.  A real deletion
+    line is 25-50 um wide, so a genuine step's steepest point sits right at
+    the clicked/given position; a crossing found several mm away is not the
+    line, it's the zone-to-zone background gradient's own antisymmetric
+    zero crossing -- a real feature, but a much bigger and differently
+    located one that the sym/anti split downstream is not built to handle
+    correctly if recentring locks onto it instead of the line.  The search
+    window (previously max(3.0, half_width_px / 3) px, unclamped) is
+    capped at max_shift_px; if the steepest point found is at or beyond
+    that cap, this is a strong signal the search escaped onto the zone
+    gradient rather than finding the line, so recentring is abandoned for
+    this call -- centre_shift_px/_mm come back 0 and p0/p1 are the
+    given/clicked position unchanged, with a warning printed rather than
+    silently returning a clamped-but-still-wrong shift.
+
+    detrend_profile (default True) fits a straight line (slope + intercept,
+    least squares, in mm) to the two-sided sampled profile using ONLY the
+    outer/wing samples on both sides (|offset| > baseline_frac *
+    half_width_px, the same fraction used for sym's own baseline below) and
+    subtracts it from the whole profile before the sym/anti split.  This
+    matters because the background here varies by more than an order of
+    magnitude across the part over tens of mm while the feature of interest
+    is a couple of mm wide at most: over a +/-half_width_mm window that
+    background dominates the raw profile, and even though a perfectly
+    linear ramp is pure antisymmetric about its own centre (so in theory it
+    can't leak into sym), the window is wide enough that the real
+    background isn't perfectly linear either, and imperfect recentring adds
+    a small offset between the ramp's true centre and the one used for the
+    split -- both let a good chunk of that dominant trend leak into sym as
+    a spurious symmetric bump. Removing the wing-fitted straight line first
+    (which cannot remove a genuine symmetric feature -- see above) shrinks
+    that leakage to whatever the background's actual local curvature is,
+    instead of its full linear magnitude.  The fitted slope is returned
+    (amplitude units per mm) precisely because a large one is itself a
+    warning that half_width_mm is too wide for how fast the local
+    background moves.
+
     mu_px is the thermal diffusion length in pixels (mu_mm / mm_per_px) --
     the physical scale that sets the wing/core boundary (wing_factor *
     mu_px): a genuine buried heat source has a footprint comparable to one
@@ -2033,8 +2166,13 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
                      wings and the reported peak is a genuine excess over a
                      true baseline, not just relative to the window mean.
       p0, p1      -- the (possibly recentred) line endpoints actually used
-      centre_shift_px -- how far recentring moved the line (0 if disabled
-                     or too few samples were available near the line)
+      centre_shift_px, centre_shift_mm -- how far recentring moved the line
+                     (0 if disabled, too few samples were available near
+                     the line, or the search hit the max_shift_mm clamp and
+                     fell back to the given position)
+      trend_slope -- the fitted background slope removed by detrend_profile
+                     (0.0 if disabled or too few outer samples to fit), in
+                     `image` units per mm
       baseline_frac, baseline_px, n_baseline_samples -- the baseline region
                      actually used (baseline_px is the (lo, hi) px range
                      |d| was required to exceed) and how many samples fell
@@ -2064,8 +2202,13 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
     if recentre:
         # Search near the assumed centre only, so a real near-line bump (the
         # signal we're actually after) can't be mistaken for a second step
-        # somewhere else in the sampled range.
-        near = np.abs(offs) <= max(3.0, half_width_px / 3)
+        # somewhere else in the sampled range -- and never look past
+        # max_shift_px, so the search cannot even consider a "steepest
+        # point" that's actually the zone gradient's own crossing several mm
+        # away (see max_shift_mm above).
+        max_shift_px = max_shift_mm / mm_per_px
+        search_radius_px = min(max(3.0, half_width_px / 3), max_shift_px)
+        near = np.abs(offs) <= search_radius_px
         o_near, p_near = offs[near], prof[near]
         order = np.argsort(o_near)
         o_near, p_near = o_near[order], p_near[order]
@@ -2081,6 +2224,14 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
         if crossing is None:
             print("  centre refinement: too few samples near the given line "
                   "-- using the given position as-is")
+        elif abs(crossing) >= search_radius_px - 1e-9 and search_radius_px >= max_shift_px - 1e-9:
+            print(f"  WARNING: centre refinement's steepest point sits at "
+                  f"{crossing * mm_per_px:+.2f} mm, at or beyond the "
+                  f"max_shift_mm={max_shift_mm:.2f} search limit -- this is "
+                  "almost certainly the zone-to-zone background gradient's "
+                  "own crossing, not the line (a real line is typically "
+                  "0.025-0.05 mm wide).  Falling back to the given/clicked "
+                  "centre with zero shift.")
         elif crossing != 0.0:
             centre_shift_px = crossing
             p0a, p1a = np.asarray(p0, float), np.asarray(p1, float)
@@ -2089,6 +2240,27 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
             shift = centre_shift_px * normal
             p0, p1 = tuple(p0a + shift), tuple(p1a + shift)
             offs, prof = _sample(p0, p1)
+
+    centre_shift_mm = centre_shift_px * mm_per_px
+
+    trend_slope = 0.0
+    if detrend_profile:
+        # Fit on the outer/wing region of the FULL two-sided profile (both
+        # sides of the line), in mm so the reported slope means the same
+        # thing regardless of bin_px -- see this function's docstring for
+        # why subtracting a wing-fitted straight line cannot remove a
+        # genuine symmetric feature, only shrink the background's leakage
+        # into one down to its actual local curvature.
+        outer = np.abs(offs) > baseline_frac * half_width_px
+        if outer.sum() >= 2:
+            d_mm_all = offs * mm_per_px
+            design = np.vstack([d_mm_all[outer], np.ones(int(outer.sum()))]).T
+            trend_slope, trend_intercept = np.linalg.lstsq(design, prof[outer], rcond=None)[0]
+            trend_slope, trend_intercept = float(trend_slope), float(trend_intercept)
+            prof = prof - (trend_slope * d_mm_all + trend_intercept)
+        else:
+            print("  detrend_profile: too few outer/wing samples to fit a "
+                  "background trend -- skipping")
 
     mid = len(offs) // 2                # offs is the symmetric bin_px grid -H..H
     d = offs[mid:]
@@ -2137,7 +2309,8 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
 
     return {
         "d": d, "sym": sym, "anti": anti, "p0": p0, "p1": p1,
-        "centre_shift_px": centre_shift_px,
+        "centre_shift_px": centre_shift_px, "centre_shift_mm": centre_shift_mm,
+        "trend_slope": trend_slope,
         "baseline_frac": baseline_frac, "baseline_px": (baseline_lo, float(d.max())),
         "n_baseline_samples": n_baseline_samples,
         "peak": peak, "wing_rms": wing_rms, "ratio": ratio, "anti_step": anti_step,
@@ -2148,7 +2321,8 @@ def symmetric_antisymmetric_profile(image, p0, p1, mu_px, mm_per_px,
 def analyse_deletion_line(amp, phase, p0, p1, mu_mm, mm_per_px,
                           ply_thickness_mm=3.0, half_width_mm=10.0,
                           bin_px=0.2, n_along=800, wing_factor=3.0,
-                          baseline_frac=0.6):
+                          baseline_frac=0.6, max_shift_mm=1.5,
+                          detrend_profile=True):
     """
     Full symmetric/antisymmetric analysis of ONE deletion line.
 
@@ -2179,10 +2353,16 @@ def analyse_deletion_line(amp, phase, p0, p1, mu_mm, mm_per_px,
 
     baseline_frac is passed straight through to symmetric_antisymmetric_profile()
     for both channels -- see its docstring for what it controls.
+    max_shift_mm and detrend_profile are also passed straight through --
+    the recentring clamp and the wing-fitted background removal -- see
+    symmetric_antisymmetric_profile()'s docstring for both.
 
     Returns {"p0", "p1" (corrected), "mu_px", "angle_deg", "fwhm_mm",
-    "verdict", "amp", "phase"}, where "amp" and "phase" are the two
-    symmetric_antisymmetric_profile() result dicts.
+    "verdict", "short_verdict", "amp", "phase"}, where "amp" and "phase"
+    are the two symmetric_antisymmetric_profile() result dicts.
+    short_verdict is one of "PLAUSIBLE", "TOO NARROW", "TOO WIDE", "NO PEAK"
+    -- the same call as `verdict` in one word, for print_line_summary()'s
+    table column; `verdict` keeps the full reasoning.
     """
     angle_deg, _ = check_line_angle(p0, p1, bin_px)
 
@@ -2190,29 +2370,36 @@ def analyse_deletion_line(amp, phase, p0, p1, mu_mm, mm_per_px,
     amp_result = symmetric_antisymmetric_profile(
         amp, p0, p1, mu_px, mm_per_px, half_width_mm=half_width_mm,
         bin_px=bin_px, n_along=n_along, wing_factor=wing_factor,
-        baseline_frac=baseline_frac, recentre=True)
+        baseline_frac=baseline_frac, recentre=True,
+        max_shift_mm=max_shift_mm, detrend_profile=detrend_profile)
     phase_result = symmetric_antisymmetric_profile(
         phase, amp_result["p0"], amp_result["p1"], mu_px, mm_per_px,
         half_width_mm=half_width_mm, bin_px=bin_px, n_along=n_along,
-        wing_factor=wing_factor, baseline_frac=baseline_frac, recentre=False)
+        wing_factor=wing_factor, baseline_frac=baseline_frac, recentre=False,
+        max_shift_mm=max_shift_mm, detrend_profile=detrend_profile)
 
     fwhm_mm = amp_result["fwhm_mm"]
     if np.isnan(fwhm_mm):
+        short_verdict = "NO PEAK"
         verdict = "no positive peak -- nothing to assess"
     elif fwhm_mm < ply_thickness_mm:
+        short_verdict = "TOO NARROW"
         verdict = (f"implausibly narrow ({fwhm_mm:.2f} mm < ply thickness "
                   f"{ply_thickness_mm:.2f} mm) -- likely a surface artefact "
                   "or sampling residue")
     elif fwhm_mm > 5 * mu_mm:
+        short_verdict = "TOO WIDE"
         verdict = (f"too wide ({fwhm_mm:.2f} mm > 5x diffusion length "
                   f"{mu_mm:.2f} mm) -- likely zone-scale structure, not a "
                   "line defect")
     else:
+        short_verdict = "PLAUSIBLE"
         verdict = f"plausible candidate ({fwhm_mm:.2f} mm wide)"
 
     return {
         "p0": amp_result["p0"], "p1": amp_result["p1"], "mu_px": mu_px,
         "angle_deg": angle_deg, "fwhm_mm": fwhm_mm, "verdict": verdict,
+        "short_verdict": short_verdict,
         "amp": amp_result, "phase": phase_result,
     }
 
@@ -2222,15 +2409,24 @@ def print_line_summary(results, is_reference=None):
     Print the per-line summary table: sym peak, wing RMS, and their ratio
     for the amplitude channel (the candidate leakage signal), the
     zone-to-zone step size (2x the antisymmetric wing level, since anti is
-    itself half the difference between the two zones), the sym peak's width
-    and physical-plausibility verdict, the line's own angle, and -- if
-    is_reference marks any lines as reference (believed sound) -- each
-    line's amplitude peak as a ratio to the mean of the reference lines'
-    peaks, so an elevated line stands out as a number rather than something
-    you have to eyeball off a plot.  Phase's three stats are printed
-    alongside amplitude's too -- phase is generally the more reliable
-    channel for detection (see the PHASE note near the bottom of this
-    file), so worth reading side by side rather than as an afterthought.
+    itself half the difference between the two zones), the sym peak's width,
+    the line's own angle, and -- if is_reference marks any lines as
+    reference (believed sound) -- each line's amplitude peak as a ratio to
+    the mean of the reference lines' peaks, so an elevated line stands out
+    as a number rather than something you have to eyeball off a plot.
+    Phase's three stats are printed alongside amplitude's too -- phase is
+    generally the more reliable channel for detection (see the PHASE note
+    near the bottom of this file), so worth reading side by side rather
+    than as an afterthought.
+
+    The physical-plausibility verdict (see analyse_deletion_line()'s
+    docstring) gets its OWN column -- `verdict` -- placed right after
+    fwhm_mm as a single word (PLAUSIBLE / TOO NARROW / TOO WIDE / NO PEAK),
+    specifically so a table of several lines shows at a glance whether ANY
+    of them are plausible candidates without reading every row's full text.
+    The full-sentence reasoning (e.g. "too wide (12.3mm > 5x diffusion
+    length 1.3mm)...") is still printed too, in `detail` at the end of the
+    row, for when the one-word column raises a question about why.
     """
     has_ref = is_reference is not None and any(is_reference)
     ref_mean = (np.mean([r["amp"]["peak"] for r, is_ref
@@ -2239,11 +2435,11 @@ def print_line_summary(results, is_reference=None):
 
     header = (f"{'line':>4}  {'angle':>6}  {'amp_peak':>10}  "
               f"{'amp_wing_rms':>13}  {'amp_ratio':>9}  {'amp_step':>9}  "
-              f"{'fwhm_mm':>8}")
+              f"{'fwhm_mm':>8}  {'verdict':>11}")
     if has_ref:
         header += f"  {'vs_ref':>7}"
     header += (f"  |  {'ph_peak_deg':>11}  {'ph_wing_rms_deg':>16}  "
-              f"{'ph_ratio':>8}  {'ph_step_deg':>11}  verdict")
+              f"{'ph_ratio':>8}  {'ph_step_deg':>11}  detail")
     print(header)
     print("-" * len(header))
     for i, res in enumerate(results):
@@ -2254,7 +2450,7 @@ def print_line_summary(results, is_reference=None):
         ref_flag = " (ref)" if has_ref and is_reference[i] else ""
         line = (f"{i:4d}  {res['angle_deg']:5.1f}d  {a['peak']:10.4g}  "
                 f"{a['wing_rms']:13.4g}  {a['ratio']:9.2f}  {a_step:9.4g}  "
-                f"{res['fwhm_mm']:8.3g}")
+                f"{res['fwhm_mm']:8.3g}  {res['short_verdict']:>11}")
         if has_ref:
             vs_ref = a["peak"] / ref_mean if ref_mean else float("nan")
             line += f"  {vs_ref:6.2f}x"
@@ -2293,13 +2489,15 @@ def _lockin_cache_path(path, fps, f_excite, register, register_upsample,
 
 def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
             roi_config_path="roi_config.json", use_saved_config=False,
-            auto_geometry=True,
+            auto_geometry=False,
             register=False, register_upsample=20, register_reference="middle",
             reject_outliers=True, outlier_mad_threshold=8.0,
             use_lockin_cache=True, force_recompute=False,
             mask_polarity="auto", mask_close_px=3, pick_mask_roi=False,
+            phase_reference="circular_mean", unwrap_phase=False,
             wing_factor=3.0, half_width_mm=4.0, bin_px=0.2, n_along=800,
-            ply_thickness_mm=2.0, baseline_frac=0.6):
+            ply_thickness_mm=2.0, baseline_frac=0.6, max_shift_mm=1.5,
+            detrend_profile=True):
     """
     mm_per_px : millimetres per pixel.  None (default) means take it from
                the geometry config instead (either loaded, or measured
@@ -2352,23 +2550,29 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                to keep from auto_setup()'s ranked candidates when
                auto_geometry=True.  Ignored when use_saved_config=True (the
                config already says how many there are).
-    auto_geometry : if True (default) and use_saved_config=False, get line
-               geometry and the fiducial ROI from auto_setup()
-               (find_deletion_lines() + auto_fiducial_roi()) instead of
-               interactive_setup() -- fully headless, no clicking, no
-               interactive matplotlib backend required.  Requires
-               mm_per_px (no calibration click in this path -- pass it
-               explicitly).  ALWAYS check lockin_line_candidates.png after
-               a run with this on: every candidate the detector considered
-               is drawn there (faded), with the selected line(s) solid,
-               specifically because on a part whose real signal is a
-               subtle symmetric bump riding on a much bigger genuine zone
-               step, the detector can lock onto that step instead of the
-               intended deletion line when the two score comparably (see
-               auto_setup()'s docstring).  If the plot shows the wrong
-               pick, or the printed margin over the runner-up is slim, set
-               this False and use interactive_setup() /
-               pick_line_endpoints() instead.
+    auto_geometry : if True and use_saved_config=False, get line geometry
+               and the fiducial ROI from auto_setup() (find_deletion_lines()
+               + auto_fiducial_roi()) instead of interactive_setup() --
+               fully headless, no clicking, no interactive matplotlib
+               backend required.  Requires mm_per_px (no calibration click
+               in this path -- pass it explicitly).  ALWAYS check
+               lockin_line_candidates.png after a run with this on: every
+               candidate the detector considered is drawn there (faded),
+               with the selected line(s) solid, specifically because on a
+               part whose real signal is a subtle symmetric bump riding on
+               a much bigger genuine zone step, the detector can lock onto
+               that step instead of the intended deletion line when the two
+               score comparably (see auto_setup()'s docstring); the same
+               scoring ambiguity has also been seen picking a fiducial ROI
+               that lands the phase reference on the wrap boundary (see
+               phase_reference below).  Default False -- interactive_setup()
+               is the default instead, precisely because both of those auto
+               picks have caused real problems here: click through it once
+               per recording and reuse the saved config with
+               use_saved_config=True afterwards, the same way you would
+               with the results of a manual click either way.  Set this
+               True only when you've confirmed lockin_line_candidates.png
+               looks right and want a fully headless run.
     roi_config_path : where to save (interactive setup) or load (saved
                config) the geometry -- lines (with each one's angle and
                reference-line tag), fiducial ROI, mm_per_px, and the
@@ -2421,22 +2625,65 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
     reject_outliers : drop frames corrupted by a camera glitch (typically a
                NUC shutter event) before anything else runs (see
                reject_outlier_frames()).  Default True.
+    phase_reference : 'circular_mean' (default) or 'fiducial_roi' -- how
+               `phase` gets rotated to put its bulk away from the +/-180
+               branch cut before display/analysis.  See reference_phase()'s
+               docstring for the full reasoning; in short, 'circular_mean'
+               references to the circular mean of every masked pixel's
+               phase, which is robust to any one site (including the
+               fiducial ROI) happening to sit near the cut, whereas
+               'fiducial_roi' (the previous, and only, behaviour) references
+               to that ROI's own median and can rotate the cut into the
+               middle of the part if the ROI itself is unlucky.  Either way,
+               a WARNING prints if too much of the masked part still sits
+               near the cut after referencing -- read it; it means the
+               phase field spans more than one turn or `part` is picking up
+               noise-dominated pixels, not that referencing failed to do
+               its job.
+    unwrap_phase : if True, spatially unwrap `phase` (skimage.restoration.
+               unwrap_phase, see unwrap_phase_field()) over the masked part
+               AFTER referencing, and use the unwrapped field for both the
+               phase display panel and every per-line phase profile.
+               Default False -- only reach for this if reference_phase()'s
+               wrap-fraction warning fires AND you've confirmed (e.g. by
+               eye on lockin_images.png) that the residual really is a
+               spatial wrap and not noise.
     wing_factor, half_width_mm, bin_px, n_along, ply_thickness_mm,
-    baseline_frac : passed straight through to analyse_deletion_line() /
-               symmetric_antisymmetric_profile() for every line -- see
-               their docstrings.  half_width_mm (default 10 mm, roughly 8
-               diffusion lengths here) and bin_px (default 0.2 px, the
-               slanted-edge oversampling step) are physical/geometric
-               quantities, not hard-coded pixel counts, so they carry the
-               same meaning across different mm_per_px.  The wing/core
-               boundary sits at wing_factor (default 3) diffusion lengths
-               from the line.  ply_thickness_mm (default 3.0) is the glass
-               ply thickness the heat source is imaged through -- sets the
-               narrow-end physical-plausibility floor (see
-               analyse_deletion_line()'s docstring).  baseline_frac
-               (default 0.6) sets where sym's own zero level is measured,
-               as a fraction of half_width_mm -- see
-               symmetric_antisymmetric_profile()'s docstring.
+    baseline_frac, max_shift_mm, detrend_profile : passed straight through
+               to analyse_deletion_line() / symmetric_antisymmetric_profile()
+               for every line -- see their docstrings.  half_width_mm
+               (default 4.0 mm here -- deliberately a few diffusion lengths
+               at a typical excitation frequency here, wide enough for a
+               real wing baseline but narrow enough that zone-scale
+               power-density variation elsewhere on the part doesn't
+               dominate; a wider window needs detrend_profile more, not
+               less) and bin_px (default 0.2 px, the slanted-edge
+               oversampling step) are physical/geometric quantities, not
+               hard-coded pixel counts, so they carry the same meaning
+               across different mm_per_px.  The wing/core boundary sits at
+               wing_factor (default 3) diffusion lengths from the line.
+               ply_thickness_mm (default 3.0) is the glass ply thickness
+               the heat source is imaged through -- sets the narrow-end
+               physical-plausibility floor (see analyse_deletion_line()'s
+               docstring).  baseline_frac (default 0.6) sets where sym's
+               own zero level is measured, as a fraction of half_width_mm
+               -- see symmetric_antisymmetric_profile()'s docstring.
+               max_shift_mm (default 1.5) clamps the centre-recentring
+               search so it can't lock onto the zone-to-zone background
+               gradient's own crossing several mm from the actual line --
+               see symmetric_antisymmetric_profile()'s docstring.
+               detrend_profile (default True) removes a wing-fitted
+               straight-line background from each profile before the
+               sym/anti split, for the same reason -- see the same
+               docstring.  Both of these are ALSO stamped into
+               roi_config.json's processing_params and checked for
+               cross-run mismatch just like half_width_mm etc. (see
+               use_saved_config above) -- and note that whatever value YOU
+               pass to any of these processing parameters always wins over
+               whatever a loaded config recorded from a previous run; the
+               recorded value is only ever used to print a mismatch
+               warning, never to silently override this call's own
+               arguments.
 
     fps is ignored for .csq / .seq inputs -- the camera's own per-frame
     timestamps are used instead (see load_csq).
@@ -2541,7 +2788,7 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                 amp, f_excite, mm_per_px, n_lines=n_lines,
                 mask_polarity=mask_polarity, mask_close_px=mask_close_px)
         else:
-            roi_config = interactive_setup(amp, n_lines=n_lines,
+            roi_config = interactive_setup(amp, phase=phase, n_lines=n_lines,
                                            calibrate=(mm_per_px is None),
                                            mask_roi=pick_mask_roi)
 
@@ -2574,7 +2821,9 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
             "mm_per_px": mm_per_px, "half_width_mm": half_width_mm,
             "bin_px": bin_px, "n_along": n_along, "f_excite": f_excite,
             "ply_thickness_mm": ply_thickness_mm, "baseline_frac": baseline_frac,
-            "mask_polarity": mask_polarity,
+            "mask_polarity": mask_polarity, "max_shift_mm": max_shift_mm,
+            "detrend_profile": detrend_profile, "phase_reference": phase_reference,
+            "unwrap_phase": unwrap_phase,
         }
         stored_params = roi_config.get("processing_params")
         if stored_params:
@@ -2591,18 +2840,6 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
 
         roi_config["processing_params"] = current_params
         save_roi_config(roi_config, roi_config_path)
-
-    with _stage("phase referencing"):
-        y0, y1, x0, x1 = fiducial_roi
-        roi = phase[y0:y1, x0:x1]
-        if roi.size == 0:
-            raise ValueError(
-                f"fiducial_roi {fiducial_roi} is empty -- it must be "
-                "(y0, y1, x0, x1) with y0 < y1 and x0 < x1"
-            )
-        ref = np.median(roi)
-        phase = np.angle(np.exp(1j * (phase - ref)))
-        print(f"  phase referenced to fiducial ({np.degrees(ref):.1f} deg)")
 
     with _stage("spatial processing"):
         # Only the part mask survives here -- spatial_highpass() is no
@@ -2626,54 +2863,41 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                      f"n_along={n_along}  f_excite={f_excite:.4g}Hz  "
                      f"mm_per_px={mm_per_px:.4g}  ply={ply_thickness_mm:.2f}mm")
 
+    with _stage("phase referencing"):
+        # Needs `part` (just computed above) -- the default 'circular_mean'
+        # method references to the whole masked population, not a single
+        # site, so it has to come after the part mask exists.  See
+        # reference_phase()'s docstring for why this replaced referencing
+        # to the fiducial ROI alone as the default: that ROI's own phase
+        # can happen to sit near the +/-180 branch cut, which then rotates
+        # the cut into the middle of the part instead of away from it.
+        phase, phase_ref_rad, phase_wrap_frac = reference_phase(
+            phase, part, fiducial_roi=fiducial_roi, method=phase_reference)
+
+        if unwrap_phase:
+            phase = unwrap_phase_field(phase, part)
+            print("  phase spatially unwrapped over the masked part -- the "
+                  "display panel and every per-line phase profile below "
+                  "now use the unwrapped field")
+
     with _stage("rendering diagnostic images"):
         disp = np.where(part, amp, np.nan)
         lo, hi = np.nanpercentile(disp, [2, 98])
 
-        # Mask and scale the phase panel -- background pixels carry no
-        # coherent signal at the lock-in frequency, so their phase is
-        # essentially random; left in, that speckle both stretches the
-        # colour scale until the real part looks uniformly flat and buries
-        # the part's outline in noise.  But part_mask() is a
-        # brightness/geometry mask, not a reach/SNR one -- amplitude AND
-        # phase both degrade with distance from wherever the excitation
-        # actually couples in (amplitude decays at the diffusion-length
-        # scale; a thermal wave's phase lag keeps growing with propagation
-        # distance, in principle without bound), so plenty of pixels
-        # geometrically inside the part can be far enough from the source
-        # that amplitude is near the noise floor AND phase has genuinely
-        # wrapped one or more times -- neither a denoising step nor a
-        # smarter branch-cut placement recovers a trustworthy value out
-        # there (confirmed directly: on real data, spatially smoothing
-        # phase's complex representation barely moved its concentration,
-        # ruling out ordinary per-pixel noise as the cause -- see
-        # _phase_display_mask()'s docstring for the full reasoning and the
-        # 180-degrees-plus-then-a-cliff-to-under-10 evidence).
-        # _phase_display_mask() finds the amplitude/noise-floor cutoff
-        # (empirically, per recording -- this boundary is set by the
-        # excitation geometry, not a universal constant) above which the
-        # surviving phase actually IS concentrated, then recentres the
-        # branch cut on that population's circular mean.  `phase` itself is
-        # referenced to the fiducial ROI (0 deg there) upstream and stays
-        # that way everywhere else (including the per-line analysis below)
-        # -- both the masking and the recentring here are display-only,
-        # local to this panel.
-        phase_mask, phase_k, circ_ref, phase_span = _phase_display_mask(amp, phase, part, nf)
-        phase_frac = phase_mask.sum() / max(int(part.sum()), 1)
-        if phase_mask.sum() < part.sum():
-            print(f"  phase panel: masking to amp > {phase_k:g}x noise floor "
-                  f"({100 * phase_frac:.0f}% of part) keeps the display "
-                  f"within a {phase_span:.0f} deg spread -- farther from the "
-                  "excitation, phase has genuinely wrapped, not just "
-                  "drifted off-centre (see _phase_display_mask())")
-        if phase_k is None:
-            print(f"  WARNING: phase panel: even the loosest amplitude/"
-                  f"noise-floor threshold tried still spans "
-                  f"{phase_span:.0f} deg -- this part may be imaged well "
-                  "beyond where phase is usable at this excitation "
-                  "frequency/frame count")
-        phase_disp = np.angle(np.exp(1j * (phase - circ_ref)))
-        phase_deg = np.where(phase_mask, np.degrees(phase_disp), np.nan)
+        # Mask and scale the phase panel the same way as the amplitude
+        # panel above -- background pixels carry no coherent signal at the
+        # lock-in frequency, so their phase is essentially random; left in,
+        # that speckle both stretches the colour scale until the real part
+        # looks uniformly flat and buries the part's outline in noise.
+        # `phase` is already referenced (and possibly unwrapped) upstream --
+        # see the "phase referencing" stage above -- so no additional
+        # recentring is needed here; percentile clipping (same 2-98% as the
+        # amplitude panel, NOT a fixed +/-180 range) keeps a handful of
+        # noisy/low-SNR pixels -- or, if unwrap_phase=True, the wider
+        # unwrapped range -- from blowing out the colour scale without
+        # discarding the rest of the part the way a hard concentration
+        # cutoff would.
+        phase_deg = np.where(part, np.degrees(phase), np.nan)
         lo_p, hi_p = np.nanpercentile(phase_deg, [2, 98])
 
         fig, ax = plt.subplots(1, 3, figsize=(16, 5))
@@ -2685,10 +2909,7 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         im1 = ax[1].imshow(disp, vmin=lo, vmax=hi)
         ax[1].set_title("amplitude (masked)")
         im2 = ax[2].imshow(phase_deg, cmap="twilight", vmin=lo_p, vmax=hi_p)
-        phase_title = "phase [deg]"
-        if phase_k is not None and phase_mask.sum() < part.sum():
-            phase_title += f"  (amp > {phase_k:g}x nf, {100 * phase_frac:.0f}% of part)"
-        ax[2].set_title(phase_title)
+        ax[2].set_title("phase [deg]")
         for a, im in zip(ax, (im0, im1, im2)):
             fig.colorbar(im, ax=a, fraction=0.046)
 
@@ -2718,15 +2939,17 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                                         half_width_mm=half_width_mm,
                                         bin_px=bin_px, n_along=n_along,
                                         wing_factor=wing_factor,
-                                        baseline_frac=baseline_frac)
+                                        baseline_frac=baseline_frac,
+                                        max_shift_mm=max_shift_mm,
+                                        detrend_profile=detrend_profile)
             results.append(res)
             a = res["amp"]
-            shift_mm = a["centre_shift_px"] * mm_per_px
             baseline_lo_mm, baseline_hi_mm = (v * mm_per_px for v in a["baseline_px"])
             ref_note = "  [reference]" if is_reference[i] else ""
             print(f"  line {i} ({res['angle_deg']:.1f} deg){ref_note}: "
                   f"centre shift {a['centre_shift_px']:+.2f} px "
-                  f"({shift_mm:+.3f} mm) from clicked position, "
+                  f"({a['centre_shift_mm']:+.3f} mm) from clicked position, "
+                  f"trend slope {a['trend_slope']:+.4g}/mm, "
                   f"baseline region |d| in [{baseline_lo_mm:.1f}, "
                   f"{baseline_hi_mm:.1f}] mm ({a['n_baseline_samples']} samples), "
                   f"sym peak {a['peak']:.4g}, wing RMS {a['wing_rms']:.4g}, "
@@ -2736,7 +2959,7 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         n = len(results)
         fig2, ax2 = plt.subplots(n, 2, figsize=(13, 4 * n), squeeze=False)
         for i, res in enumerate(results):
-            shift_mm = res["amp"]["centre_shift_px"] * mm_per_px
+            shift_mm = res["amp"]["centre_shift_mm"]
             for col, (label, r, scale) in enumerate((
                     ("amplitude", res["amp"], 1.0),
                     ("phase [deg]", res["phase"], 180.0 / np.pi))):
@@ -2804,9 +3027,11 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
 #   magnitude (2x the wing-level plateau of anti, since anti is defined as
 #   HALF the difference) is worth cross-checking against your own geometry /
 #   coating-thickness model for the two zones, mostly as a sanity check that
-#   the decomposition centred correctly (see centre_shift_px in each line's
-#   result -- a large shift means the clicked or given line position was off
-#   by that much).
+#   the decomposition centred correctly (see centre_shift_px/_mm in each
+#   line's result -- a large shift means the clicked or given line position
+#   was off by that much; recentring is clamped to max_shift_mm and falls
+#   back to zero shift with a warning rather than trusting a multi-mm
+#   "crossing", which is the zone gradient's own transition, not the line).
 #
 # PHASE
 #   Prefer phase for detection.  Amplitude scales with emissivity, view angle,
@@ -2817,6 +3042,16 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
 #   dominated by reflection artifacts and phase images largely are not.  This
 #   pipeline decomposes phase the same symmetric/antisymmetric way as
 #   amplitude, side by side, for exactly this reason.
+#
+#   Before any of that, `phase` has to be REFERENCED (rotated so its bulk
+#   sits away from lockin()'s +/-180 deg branch cut -- see
+#   reference_phase()) and, if the WARNING it prints fires, possibly
+#   UNWRAPPED (unwrap_phase_field(), analyse()'s unwrap_phase=True).  A
+#   part that reads as two discontinuous halves in lockin_images.png's
+#   phase panel, or profiles with unexplained +/-20 deg swings that don't
+#   track any real thermal feature, is very likely still sitting on the
+#   branch cut, not a genuine defect signature -- check the wrap-fraction
+#   warning before trusting either.
 #
 # ALONG-LINE PROFILE SHAPE (along_line_profile() -- not run by default now,
 # call it yourself on `amp` for a chosen line if you want this view)
@@ -2841,30 +3076,30 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # First run on a new recording: auto_geometry=True (the default) detects
-    # n_lines deletion lines and places the fiducial ROI automatically, no
-    # clicking, no display needed at all.  Requires mm_per_px explicitly --
-    # there's no calibration click in this path.  This saves roi_config.json.
-    # ALWAYS check lockin_line_candidates.png afterwards: it shows every
-    # candidate line the detector considered (faded) and which one(s) it
-    # selected (solid) -- confirm the pick before trusting the run.  If it
-    # picked wrong (locked onto a genuine zone-to-zone step instead of the
-    # real deletion line -- see analyse()'s docstring on auto_geometry),
-    # rerun with auto_geometry=False to click through interactive_setup()
-    # instead.  Every later run of the SAME recording: set
-    # use_saved_config=True to reload roi_config.json and skip detection
-    # entirely (auto_geometry is then ignored).
+    # First run on a new recording: auto_geometry=False (the default) walks
+    # through interactive_setup() -- click each deletion line's endpoints,
+    # then the fiducial ROI (shown side by side with phase; a click too
+    # close to the phase wrap boundary is rejected on the spot, see
+    # interactive_setup()'s docstring).  This saves roi_config.json.  Every
+    # later run of the SAME recording: set use_saved_config=True to reload
+    # roi_config.json and skip clicking entirely.  auto_geometry=True
+    # switches to fully headless detection (find_deletion_lines() +
+    # auto_fiducial_roi()) instead -- only turn it on after confirming
+    # lockin_line_candidates.png picks the right line(s) on this part; see
+    # analyse()'s docstring on auto_geometry for why manual is the default.
     analyse(
-        path="FLIR0022.csq",
+        path="FLIR0029.csq",
         fps=30.0,
         f_excite=0.1,
-        mm_per_px=2.23,            # required when auto_geometry=True
-        n_lines=1,                 # how many deletion lines to detect
+        mm_per_px=2.23,            # required when auto_geometry=True;
+                                   # otherwise measured via interactive
+                                   # setup's calibration click if left None
+        n_lines=1,                 # how many deletion lines to click/detect
         use_saved_config=False,    # True to reload roi_config.json instead
         roi_config_path="roi_config.json",
-        # auto_geometry=True (the default) -- set False for interactive_setup()
-        # (click-through, with an optional calibration pair if mm_per_px is
-        # left unset) instead of automatic detection.
+        # auto_geometry=False (the default) -- set True for auto_setup()
+        # (find_deletion_lines() + auto_fiducial_roi(), fully headless)
+        # instead of clicking through interactive_setup().
         # register=False (the default) -- turn on only if the part's
         # material has enough thermal expansion to plausibly move a
         # measurable fraction of a pixel against its fixture; see
@@ -2887,11 +3122,28 @@ if __name__ == "__main__":
                                    # or streak is splitting the part into two
                                    # disconnected pieces, not a polarity
                                    # mismatch (see part_mask()'s docstring)
+        # phase_reference="circular_mean" (the default) -- references phase
+        # to the circular mean of the whole masked part rather than just
+        # the fiducial ROI, so one unlucky ROI site can't rotate the wrap
+        # boundary into the middle of the part; see reference_phase().
+        # unwrap_phase=False (the default) -- set True only if
+        # reference_phase()'s wrap-fraction warning fires AND you've
+        # confirmed by eye that it's a genuine spatial wrap, not noise.
         ply_thickness_mm=2.0,      # the glass ply the source is imaged
                                    # through -- sets the narrow-end
                                    # physical-plausibility floor
-        half_width_mm=10.0,        # cross-line window, ~8 diffusion
-                                   # lengths at a typical f_excite here
+        half_width_mm=4.0,         # cross-line window -- a few diffusion
+                                   # lengths at a typical f_excite here;
+                                   # detrend_profile matters more the wider
+                                   # this is set
         bin_px=0.2,                # slanted-edge oversampling step
         n_along=800,               # along-line samples pooled per bin
+        # max_shift_mm=1.5 (the default) -- clamps how far centre
+        # recentring is allowed to search; a real line is 25-50 um wide, so
+        # a "steepest point" found several mm away is the zone gradient's
+        # own crossing, not the line -- see symmetric_antisymmetric_profile().
+        # detrend_profile=True (the default) -- removes a wing-fitted
+        # straight-line background from each profile before the sym/anti
+        # split, since the background here can vary by an order of
+        # magnitude over the same window the line's own signal sits in.
     )
