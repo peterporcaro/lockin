@@ -2487,14 +2487,14 @@ def _lockin_cache_path(path, fps, f_excite, register, register_upsample,
     return Path(f"{path}.lockin_cache_{digest}.npz")
 
 
-def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
+def analyse(path, fps, f_excite, mm_per_px=None, n_lines=5,
             roi_config_path="roi_config.json", use_saved_config=False,
             auto_geometry=False,
             register=False, register_upsample=20, register_reference="middle",
             reject_outliers=True, outlier_mad_threshold=8.0,
             use_lockin_cache=True, force_recompute=False,
             mask_polarity="auto", mask_close_px=3, pick_mask_roi=False,
-            phase_reference="circular_mean", unwrap_phase=False,
+            phase_reference="circular_mean", unwrap_phase=True,
             wing_factor=3.0, half_width_mm=4.0, bin_px=0.2, n_along=800,
             ply_thickness_mm=2.0, baseline_frac=0.6, max_shift_mm=1.5,
             detrend_profile=True):
