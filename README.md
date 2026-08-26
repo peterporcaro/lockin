@@ -301,9 +301,12 @@ simple and linear.)*
   contaminate the interior.
 - **Automatic line detection** (`_tls_axis`, `_hough_peak`, `_extract_segment`,
   `find_deletion_lines`, `find_deletion_line`) — a Hough-transform-based
-  detector, **not used by `analyse()`'s default pipeline** (geometry now comes
-  from clicking or a saved config — see §6), but kept as a standalone tool and
-  still used internally by `auto_fiducial_roi()`:
+  detector. `find_deletion_lines` is what `auto_setup()` calls, and is used
+  by `analyse()`'s default pipeline as of `auto_geometry=True` (§6) — see
+  Design Decisions for the risk that comes with that and how
+  `lockin_line_candidates.png` mitigates it. `find_deletion_line` (the
+  single-strongest-line convenience wrapper) isn't called by the pipeline
+  itself, but remains available standalone:
   - `_tls_axis` fits a line to a weighted point cloud via total least squares
     (the major axis of the weighted covariance) rather than ordinary
     y-on-x regression, so it doesn't blow up on a near-vertical line.
@@ -331,9 +334,12 @@ simple and linear.)*
   — automatic placement of the fiducial/phase-reference ROI in the part's
   quiet zone, farthest from every detected line *and* from the part's own
   boundary (a scalloped edge or busbar is exactly where motion artefacts and
-  emissivity variation are worst). Not used by `analyse()`'s default pipeline
-  (the ROI is now clicked or loaded from config) but available standalone.
-  Two specific correctness details worth noting: the "farthest point" search
+  emissivity variation are worst). Driven automatically by `auto_setup()`,
+  and used by `analyse()`'s default pipeline for the same reason as
+  automatic line detection above (§6); still available standalone, and
+  still what a manually-clicked config falls back to only if you choose
+  `auto_geometry=False`. Two specific correctness details worth
+  noting: the "farthest point" search
   averages the whole near-max **plateau** rather than taking the first tied
   pixel (a naive `argmax` would bias the ROI to one edge of a quiet region
   instead of its centre), and the edge-clearance distance is *not* derived
@@ -385,7 +391,23 @@ simple and linear.)*
 
 #### 6. Geometry selection (interactive + persisted JSON config)
 
-- **`interactive_setup(image, n_lines=1, calibrate=False)`** — one
+- **`auto_setup(amp, f_excite, mm_per_px, n_lines=1, ...)`** — what
+  `analyse()` uses by default (`auto_geometry=True`): runs
+  `find_deletion_lines()` (on a spatially high-passed copy of the amplitude
+  image, at `highpass_mu_factor` — default 2.5 — times the diffusion length)
+  and `auto_fiducial_roi()` to build a geometry config with no clicking and
+  no interactive backend required — a full run can go headless end to end.
+  Requires `mm_per_px` up front, since there's no calibration click in this
+  path. Returns `(config, candidates, n_selected)`: `candidates` is the
+  *full* ranked list `find_deletion_lines()` found (not just the `n_lines`
+  kept), which `plot_line_candidates()` visualizes. Every line comes back
+  untagged as a reference — there's no human judgement call being made here
+  — so tag one by hand in `roi_config.json` afterwards if the summary table
+  should reference against it. See Design Decisions for the risk that comes
+  with defaulting to this and how the diagnostic below mitigates it.
+- **`interactive_setup(image, n_lines=1, calibrate=False)`** — the manual
+  fallback, for when `auto_setup()`'s pick is wrong (check
+  `lockin_line_candidates.png`) or `mm_per_px` isn't known yet. One
   click-through session (via `matplotlib`'s `ginput`) on a displayed frame
   that defines every piece of geometry the pipeline needs: `n_lines`
   deletion lines (two endpoint clicks each, with the line's angle computed
@@ -396,7 +418,20 @@ simple and linear.)*
   (two points spanning a known physical distance, prompted for at the
   console) to compute `mm_per_px` directly rather than hard-coding it. Each
   selection is confirmed visually before moving to the next. Requires an
-  interactive backend — will not work headless.
+  interactive backend — will not work headless. Used by `analyse()` when
+  `auto_geometry=False`.
+- **`plot_line_candidates(amp, part, candidates, n_selected, fiducial_roi, path="lockin_line_candidates.png")`**
+  — the diagnostic companion to `auto_setup()`: every candidate line found,
+  drawn on the masked amplitude image, faint red and unlabelled for the
+  ones *not* kept and solid green for the ones that were, plus the
+  auto-placed fiducial ROI box. Deliberately a **separate figure** from
+  `lockin_images.png` rather than added to it — `lockin_images.png`'s own
+  line-overlay omission (§ rendering diagnostic images) was about
+  decluttering routine per-run output where the geometry is already known
+  and trusted; here the whole point is reviewing an *automatic* pick before
+  trusting it, so the overlay — runners-up included, kept visible even
+  though faint — is the diagnostic, not clutter. Called automatically by
+  `analyse()` whenever `auto_geometry=True`.
 - **`save_roi_config(config, path="roi_config.json")`** /
   **`load_roi_config(path="roi_config.json")`** — persist/reload the
   geometry (and, once `analyse()` has run once, the processing parameters —
@@ -476,6 +511,7 @@ from the part's normal zone-to-zone structure:
 | `lockin_images.png` | Always | Three panels: raw amplitude, masked amplitude, masked phase (degrees), with the fiducial ROI overlaid. |
 | `lockin_line_profiles.png` | Always | One row per line, sym/anti curves for amplitude and phase, with the diffusion-length band shaded and the run's processing parameters stamped at the bottom. |
 | `lockin_motion.png` | Only if `register=True` | Registration offset vs. time, and part centroid before/after registration (an independent motion check). |
+| `lockin_line_candidates.png` | Whenever `auto_geometry=True` (the default) and `use_saved_config=False` | Every line candidate `find_deletion_lines()` found (faint red) with the `n_lines` actually selected (solid green) and the auto-placed fiducial ROI, overlaid on the masked amplitude image — review this before trusting an automatic pick. |
 | `lockin_pixel_diag.png` | Only if `diagnose_pixel()` called manually | One pixel's raw trace with its lock-in fit overlaid. |
 
 ### Design decisions
@@ -517,13 +553,22 @@ worth calling out specifically:
    along-line crossings at different sub-pixel phases (viable only because
    the line is tilted relative to the pixel grid — see `check_line_angle`)
    recovers genuinely finer effective resolution.
-4. **Geometry comes from clicking or a saved config, not auto-detection, by
-   default.** The automatic Hough-based line detector (§5) was built around
-   finding the strongest sharp ridge in a high-passed image — exactly the
-   signal a genuine zone-to-zone step produces, which is not what should be
-   selected. Interactive selection (or a config saved from a prior
-   interactive session) sidesteps that entirely; the automatic detector
-   remains available standalone for parts without real zone steps.
+4. **Geometry defaults to automatic detection (`auto_geometry=True`), paired
+   with a mandatory review image.** The Hough-based line detector (§5) was
+   built around finding the strongest sharp ridge in a high-passed image —
+   exactly the signal a genuine zone-to-zone step also produces, which is
+   *not* what should be selected, so an automatic pick always carries some
+   risk of locking onto the step instead of the real line. That risk is
+   accepted in exchange for headless, no-clicking operation on the common
+   case, on the condition that it's never silent: `lockin_line_candidates.png`
+   is produced on every automatic run specifically so a human can see every
+   candidate the detector considered (faint) against the one(s) it picked
+   (solid) and catch a wrong pick before trusting the run's results — this is
+   the same trade `find_deletion_line()`'s own printed runner-up margin makes
+   in text form. When the plot shows the wrong pick, or `mm_per_px` isn't
+   known yet (automatic mode has no calibration click), fall back to
+   `interactive_setup()` via `analyse(auto_geometry=False)` — full manual
+   control, still available, just no longer the default.
 5. **Processing parameters are recorded and checked, not just used.**
    `half_width_mm`, `bin_px`, `n_along`, `f_excite`, `mm_per_px`, and
    `ply_thickness_mm` are stamped into `roi_config.json` and onto every
@@ -558,30 +603,64 @@ worth calling out specifically:
    OUTPUT MEANS" comment block at the bottom of the file for the full
    physical interpretation notes (including along-line profile shape
    diagnostics, and the recommended null test with the supply off).
+9. **The phase panel in `lockin_images.png` re-centres its own +-180 deg
+   wraparound point before display.** `phase` is referenced to the
+   fiducial ROI (0 deg there) once, upstream, and stays that way
+   everywhere else in the pipeline. But `np.angle()`'s wraparound point is
+   fixed at +-180 deg *from that reference* — if the part's real phase
+   spread happens to reach anywhere near there (a real, physical
+   zone-to-zone phase difference, not an error), the wrap falls INSIDE the
+   occupied data instead of in the empty part of the circle, and a
+   perfectly continuous physical quantity shows up in the figure as a
+   sharp, unphysical colour seam across part of the part (observed
+   directly on real data). The panel now re-wraps around the *circular
+   mean* of the part's own masked phase instead of around the fiducial
+   reference — for the roughly unimodal distribution expected here (one
+   coherent physical process across the part), that puts the branch cut
+   in the least-populated part of the circle, as far from the real data as
+   the distribution allows. This is display-only: the numeric `phase`
+   array used by the per-line symmetric/antisymmetric analysis is
+   unaffected.
 
 ### Quick start
 
 ```python
 from lockin_thermography import analyse
 
-# First run on a new recording: click through geometry setup
-# (n_lines deletion lines, fiducial ROI, and a calibration pair since
-# mm_per_px is left unset) and save it to roi_config.json.
+# First run on a new recording: auto_geometry=True (the default) detects
+# geometry automatically -- no clicking, no interactive backend needed.
+# mm_per_px is required up front (no calibration click in this path).
+# ALWAYS review lockin_line_candidates.png afterwards, before trusting the
+# result -- see Design Decisions #4.
 analyse(
     path="FLIR0022.csq",
     fps=30.0,
     f_excite=0.1,        # must match F_MOD in psu_control.py
+    mm_per_px=2.23,
     n_lines=3,
     use_saved_config=False,
 )
 
 # Every later run of the SAME recording: reload the saved geometry and
-# processing parameters instead of re-clicking -- also works headless.
+# processing parameters instead of re-detecting -- also works headless.
 analyse(
     path="FLIR0022.csq",
     fps=30.0,
     f_excite=0.1,
     use_saved_config=True,
+)
+
+# When the candidates plot shows the wrong pick, or mm_per_px isn't known
+# yet: fall back to clicking through geometry by hand (n_lines deletion
+# lines, fiducial ROI, and a calibration pair since mm_per_px is left
+# unset here) with auto_geometry=False.
+analyse(
+    path="FLIR0023.csq",
+    fps=30.0,
+    f_excite=0.1,
+    n_lines=3,
+    use_saved_config=False,
+    auto_geometry=False,
 )
 ```
 
@@ -598,7 +677,7 @@ Optional: `flirpy`, `pillow`, `pylibjpeg`, `pylibjpeg-libjpeg` (for
 Nine standalone test scripts (run with `python <file>.py`; each prints
 `PASS`/`FAIL` per check and an `N/M passed` summary — there is no pytest
 harness, by design, matching the rest of the project's plain-script style)
-plus one end-to-end smoke test. All were written to reproduce a specific,
+plus two end-to-end smoke tests. All were written to reproduce a specific,
 previously-observed failure mode on synthetic data with a known ground
 truth, not just to exercise code paths generically.
 
@@ -614,6 +693,7 @@ truth, not just to exercise code paths generically.
 | `test_slanted_edge.py` | Demonstrates the actual sub-pixel resolution gain: on a transition narrower than one native pixel, `slanted_edge_profile()` recovers the true 10-90% rise width meaningfully more accurately than nearest-neighbour `cross_line_profile()` does. Also checks `check_line_angle()` fires for a range of angles at/near 0, 45, and 90 degrees and stays quiet for a spread of well-tilted angles. | 14/14 |
 | `test_roi_config.py` | `save_roi_config()`/`load_roi_config()` JSON roundtrip: exact roundtrip of a multi-line config, per-line reference tag and angle preserved, and processing parameters preserved. | 5/5 |
 | `test_pipeline_smoke.py` | End-to-end `analyse()` run (fully headless, via a hand-built `roi_config`) on a synthetic sequence with two deletion lines splitting genuinely different power-density zones and a leakage bump on only one of them: confirms the defect line's peak and ratio clearly separate from the clean line's, the clean line correctly reads as "not a line defect" via the width check, all expected output files are produced, an inverted/empty fiducial ROI is rejected with a clear error, and background-masked phase spread is much tighter than the unmasked full-frame spread (confirming the masking in the diagnostic figure is doing real work). | assertions, no numbered count |
+| `test_auto_geometry.py` | End-to-end `analyse(auto_geometry=True)` run (no `roi_config`, no clicking) on the same two-zone synthetic sequence as the smoke test above: confirms `auto_setup()` finds the requested number of lines and places a fiducial ROI with no geometry supplied up front, and that every expected output file — including `lockin_line_candidates.png` — is produced. Not a claim that auto-detection picks the *intended* line (it can legitimately lock onto the scene's own zone-boundary step instead — see Design Decisions #4); the point is proving the headless wiring runs end to end and that the candidates review image exists to catch exactly that failure mode. | assertions, no numbered count |
 
 ### Running the tests
 

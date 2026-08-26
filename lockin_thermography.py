@@ -809,6 +809,92 @@ def _choose_polarity(amp, high, low, fiducial_roi, variance_sigma_px):
     return choice, (high_cc if choice == "bright" else low_cc)
 
 
+def _phase_display_mask(amp, phase, part, nf, span_target_deg=60.0,
+                        k_values=(1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0,
+                                 7.0, 8.0, 9.0, 10.0, 12.0, 15.0, 20.0,
+                                 25.0, 30.0, 40.0, 50.0),
+                        min_px=50):
+    """
+    Find the loosest amplitude/noise-floor threshold above which the part's
+    phase is tightly enough concentrated to display without a wraparound
+    seam, and return (mask, k_used, circ_ref, achieved_span_deg).
+
+    part_mask() is a brightness/geometry mask -- it says a pixel is inside
+    the part's footprint, not that its phase there is trustworthy.
+    Amplitude and phase both degrade TOGETHER with distance from wherever
+    the excitation actually couples into the coating: amplitude decays
+    (at the diffusion-length scale -- the same physical picture behind
+    wing_factor * mu_mm elsewhere in this file), and a thermal wave's phase
+    lag genuinely keeps growing with propagation distance, in principle
+    without bound -- well past +-180 degrees on a part whose extent
+    reaches many diffusion lengths from the excitation. So the region
+    where phase legitimately varies by more than a wrap IS, physically,
+    close to the same region where amplitude has already decayed toward
+    the noise floor; the two aren't separable, and there is no single
+    branch-cut placement, nor any denoising, that recovers a trustworthy
+    phase value out there. Confirmed directly on real data: Gaussian-
+    smoothing the phase's complex representation (exp(1j*phase), the
+    correct way to average a circular quantity) from sigma=0 out to
+    sigma=8 px changed the masked part's circular concentration by under
+    3% -- ruling out ordinary per-pixel noise as the cause, since that
+    would average out under smoothing, and pointing at a genuine, spatially
+    real, wide phase spread instead. Sweeping the amplitude threshold
+    instead is what actually works: from 1x to 9x the noise floor the
+    2-98th-percentile spread of the recentred phase sat above 180 degrees
+    at every step, then dropped to under 10 degrees at 10x -- a one-step
+    cliff, not a gradual improvement, consistent with "close to the
+    source" vs. "everywhere else" rather than a continuum.
+
+    Because that boundary reflects THIS recording's excitation geometry
+    (how much of the imaged part is actually within a few diffusion
+    lengths of where power couples in), not a fixed constant, it's found
+    here empirically rather than hard-coded, the same way this file finds
+    other physically-set boundaries from the data instead of a pixel
+    count: try increasing k, and for each candidate, recentre the
+    surviving population around its own circular mean (see analyse()'s
+    "rendering diagnostic images" stage for why recentring ALONE, without
+    this floor, isn't enough -- a genuinely far-from-source population
+    isn't just off-centre, it's spread across a real physical range) and
+    measure the resulting spread; return the first (smallest, so the
+    display keeps as much of the part as it safely can) k whose spread
+    clears span_target_deg. Stops early if a threshold would leave fewer
+    than min_px pixels (too sparse to say anything about, let alone
+    display). Expect the chosen k -- and how much of the part survives it
+    -- to vary a lot between recordings: a small part imaged close to its
+    excitation can keep nearly all of it, while a part imaged well beyond
+    a few diffusion lengths from its excitation may only be trustworthy
+    near that source, exactly like the per-line wing/core split elsewhere
+    in this file.
+
+    Returns (part, None, ref_over_whole_part, whatever_spread_that_was) if
+    even the loosest threshold tried never gets under span_target_deg
+    (nothing to mask by, so the caller displays everything, unmasked
+    further, and should treat the returned spread as a "still this bad"
+    warning) -- and the SAME shape one level tighter (mask, k, ref, span)
+    if some threshold worked but not the very first one tried.
+    """
+    fallback = None
+    for k in k_values:
+        m = part & (amp > k * nf)
+        if int(m.sum()) < min_px:
+            break
+        ph_m = phase[m]
+        ref = float(np.angle(np.mean(np.exp(1j * ph_m))))
+        rec_deg = np.degrees(np.angle(np.exp(1j * (ph_m - ref))))
+        span = float(np.percentile(rec_deg, 98) - np.percentile(rec_deg, 2))
+        fallback = (m, k, ref, span)
+        if span <= span_target_deg:
+            return fallback
+    if fallback is not None:
+        return fallback
+    part_phase = phase[part]
+    ref = (float(np.angle(np.mean(np.exp(1j * part_phase))))
+          if part_phase.size else 0.0)
+    rec_deg = np.degrees(np.angle(np.exp(1j * (part_phase - ref)))) if part_phase.size else np.array([0.0])
+    span = float(np.percentile(rec_deg, 98) - np.percentile(rec_deg, 2))
+    return part, None, ref, span
+
+
 def part_mask(amp, mask_polarity="auto", erosion_px=10, close_px=3,
              fiducial_roi=None, line_endpoints=None, mask_roi=None,
              min_area_frac=0.05, max_area_frac=0.95, variance_sigma_px=15):
@@ -1567,10 +1653,13 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
     One click-through setup session on a displayed frame -- typically the
     raw lock-in amplitude image, or a single representative raw frame if
     amplitude isn't computed yet -- that defines every piece of geometry
-    this pipeline needs by hand, rather than trying to auto-detect it on a
-    part where the true signal is a subtle symmetric bump riding on top of
-    a much bigger, genuine zone-to-zone step (auto-detectors built around
-    "big and sharp" would just find the step).
+    this pipeline needs by hand.  Used by analyse() when auto_geometry=False
+    (or via automatic fallback logic left to the caller): the manual
+    alternative to auto_setup() for a part where the true signal is a
+    subtle symmetric bump riding on top of a much bigger, genuine
+    zone-to-zone step, and auto_setup()'s detector -- built around "big and
+    sharp" -- has locked onto the step instead (check
+    lockin_line_candidates.png to tell).
 
     Walks through, in order:
       1. n_lines deletion lines, each as two endpoint clicks.  Each line's
@@ -1585,9 +1674,9 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
          AND from the part edge.  Both are bad reference sites: a line
          carries the zone step this whole feature exists to separate out,
          and an edge is where motion artefacts and emissivity variation are
-         worst (see auto_fiducial_roi()'s docstring, which this replaces as
-         the default but is still available for auto-placement if you'd
-         rather not click).
+         worst (see auto_fiducial_roi()'s docstring -- analyse() places the
+         ROI this way automatically by default; click it by hand here only
+         when overriding that with auto_geometry=False).
       3. if calibrate=True, two points spanning a KNOWN physical distance,
          prompted for at the console, to compute mm_per_px directly instead
          of hard-coding it.
@@ -1685,6 +1774,141 @@ def interactive_setup(image, n_lines=1, calibrate=False, mask_roi=False):
     plt.close(fig)
     return {"lines": lines, "fiducial_roi": fiducial_roi, "mm_per_px": mm_per_px,
             "mask_roi": mask_roi_pts}
+
+
+def auto_setup(amp, f_excite, mm_per_px, n_lines=1, mask_polarity="auto",
+               mask_close_px=3, highpass_mu_factor=2.5, **find_kwargs):
+    """
+    Automatic alternative to interactive_setup(): detects deletion lines and
+    places the fiducial ROI without clicking, so a full run (including
+    geometry) can go headless end to end.  This is what analyse() uses by
+    default (auto_geometry=True).
+
+    find_deletion_lines() is built around "line is bright, sharp, and
+    spatially coherent" -- exactly the trait a genuine zone-to-zone
+    power-density step also has, so on a part where two or more candidates
+    score close together the automatic pick can land on a step-adjacent
+    artefact rather than the real deletion line a human eye would pick
+    immediately (see find_deletion_lines()'s own docstring on this).
+    ALWAYS check lockin_line_candidates.png after a run (see analyse(),
+    auto_geometry=True), which shows every candidate considered, not just
+    the winner(s) -- if the printed margin over the runner-up is slim, or
+    the plot shows the wrong pick, re-run with auto_geometry=False and a
+    manually clicked config (interactive_setup()) instead.
+
+    Builds a preliminary part mask via part_mask() -- without the
+    fiducial_roi / line_endpoints hints, since those come FROM this
+    function and can't be used to inform it -- spatially high-passes the
+    amplitude image at highpass_mu_factor times the thermal diffusion
+    length at f_excite (see spatial_highpass()'s docstring for why that
+    factor range isolates line-like features), and runs
+    find_deletion_lines() / auto_fiducial_roi() on the result.  The final,
+    hint-informed part mask actually used for analysis is recomputed later
+    in analyse() once this geometry is known, so a rough mask here is fine.
+
+    mm_per_px is required -- there's no calibration click in this path, and
+    it's needed anyway to convert the diffusion length to pixels.
+
+    **find_kwargs are passed through to find_deletion_lines() (e.g.
+    ridge_percentile, min_length_px, min_coverage) to tune detection on an
+    unusual part.
+
+    Returns (config, candidates, n_selected): config is shaped like
+    interactive_setup()'s return (every line untagged as a reference --
+    there's no human judgement call here to make that call; edit
+    roi_config.json by hand afterwards if you want one tagged).
+    candidates is the FULL ranked list find_deletion_lines() produced,
+    strongest first; the selected lines are candidates[:n_selected]. Both
+    are what lockin_line_candidates.png visualises.
+    """
+    part = part_mask(amp, mask_polarity=mask_polarity, close_px=mask_close_px)
+
+    alpha = 5e-7                                        # m^2/s, glass
+    mu_mm = np.sqrt(alpha / (np.pi * f_excite)) * 1000
+    sigma_px = highpass_mu_factor * mu_mm / mm_per_px
+    amp_hp = spatial_highpass(amp, sigma_px)
+
+    find_kwargs.setdefault("max_lines", max(n_lines, 4))
+    candidates = find_deletion_lines(amp_hp, part, **find_kwargs)
+    if not candidates:
+        raise ValueError(
+            "auto_setup(): no line-like feature found -- fall back to "
+            "interactive_setup() / pick_line_endpoints()"
+        )
+
+    chosen = candidates[:n_lines]
+    if len(chosen) < n_lines:
+        print(f"  WARNING: auto_setup() only found {len(chosen)} line(s), "
+              f"fewer than the requested n_lines={n_lines}")
+
+    lines = []
+    for seg in chosen:
+        p0, p1 = seg["p0"], seg["p1"]
+        angle_deg = _line_angle_deg(p0, p1)
+        lines.append({"p0": list(p0), "p1": list(p1), "angle_deg": angle_deg,
+                     "is_reference": False})
+        print(f"  auto-detected line: ({p0[0]:.0f}, {p0[1]:.0f}) -> "
+              f"({p1[0]:.0f}, {p1[1]:.0f})  ({angle_deg:.1f} deg)  "
+              f"score {seg['score']:.3g}  coverage {seg['coverage']:.2f}")
+
+    fiducial_roi = list(auto_fiducial_roi(part, chosen))
+    print(f"  auto-placed fiducial ROI: y[{fiducial_roi[0]}:{fiducial_roi[1]}] "
+          f"x[{fiducial_roi[2]}:{fiducial_roi[3]}]")
+
+    config = {"lines": lines, "fiducial_roi": fiducial_roi,
+             "mm_per_px": mm_per_px, "mask_roi": None}
+    return config, candidates, len(chosen)
+
+
+def plot_line_candidates(amp, part, candidates, n_selected, fiducial_roi,
+                         path="lockin_line_candidates.png"):
+    """
+    Diagnostic for auto_geometry=True: every line-like feature
+    find_deletion_lines() found, ranked strongest first, drawn as a mostly
+    transparent overlay on the masked amplitude image so a human can
+    confirm at a glance that the automatic pick(s) -- solid, bright green --
+    landed on the intended line(s) rather than a close runner-up.  Faint,
+    unlabelled runners-up are the point: a wrong pick with a comparable
+    score should stay visible here, not disappear.
+
+    Kept as its own separate figure rather than added to lockin_images.png,
+    which deliberately omits line overlays even for a single manually
+    clicked line (see analyse()'s "rendering diagnostic images" stage) --
+    that decision was about decluttering the routine per-run output, not
+    about candidate review, which only exists on the auto-detection path
+    and is exactly the moment an overlay earns its clutter.
+    """
+    disp = np.where(part, amp, np.nan)
+    lo, hi = np.nanpercentile(disp, [2, 98])
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.imshow(disp, vmin=lo, vmax=hi)
+
+    for i, seg in enumerate(candidates):
+        (x0, y0), (x1, y1) = seg["p0"], seg["p1"]
+        selected = i < n_selected
+        ax.plot([x0, x1], [y0, y1],
+               color="lime" if selected else "red",
+               lw=2.5 if selected else 1.5,
+               alpha=0.9 if selected else 0.25,
+               solid_capstyle="round")
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        ax.annotate(f"{i}" + (" selected" if selected else ""),
+                   (mx, my), color="white", fontsize=8,
+                   ha="center", va="center",
+                   alpha=1.0 if selected else 0.5)
+
+    fy0, fy1, fx0, fx1 = fiducial_roi
+    ax.add_patch(Rectangle((fx0, fy0), fx1 - fx0, fy1 - fy0,
+                           fill=False, edgecolor="cyan", lw=1.5))
+
+    ax.set_title(f"auto-detected line candidates: {len(candidates)} found, "
+                f"{n_selected} selected (green, solid)")
+    ax.set_xlim(0, part.shape[1]); ax.set_ylim(part.shape[0], 0)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  saved {path}")
 
 
 def save_roi_config(config, path="roi_config.json"):
@@ -2069,6 +2293,7 @@ def _lockin_cache_path(path, fps, f_excite, register, register_upsample,
 
 def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
             roi_config_path="roi_config.json", use_saved_config=False,
+            auto_geometry=True,
             register=False, register_upsample=20, register_reference="middle",
             reject_outliers=True, outlier_mad_threshold=8.0,
             use_lockin_cache=True, force_recompute=False,
@@ -2123,9 +2348,27 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
                ("mask_roi") and reused automatically, headlessly, on every
                later run with use_saved_config=True -- no need to pass this
                again.
-    n_lines : how many deletion lines to click during interactive setup.
-               Ignored when use_saved_config=True (the config already says
-               how many there are).
+    n_lines : how many deletion lines to click during interactive setup, or
+               to keep from auto_setup()'s ranked candidates when
+               auto_geometry=True.  Ignored when use_saved_config=True (the
+               config already says how many there are).
+    auto_geometry : if True (default) and use_saved_config=False, get line
+               geometry and the fiducial ROI from auto_setup()
+               (find_deletion_lines() + auto_fiducial_roi()) instead of
+               interactive_setup() -- fully headless, no clicking, no
+               interactive matplotlib backend required.  Requires
+               mm_per_px (no calibration click in this path -- pass it
+               explicitly).  ALWAYS check lockin_line_candidates.png after
+               a run with this on: every candidate the detector considered
+               is drawn there (faded), with the selected line(s) solid,
+               specifically because on a part whose real signal is a
+               subtle symmetric bump riding on a much bigger genuine zone
+               step, the detector can lock onto that step instead of the
+               intended deletion line when the two score comparably (see
+               auto_setup()'s docstring).  If the plot shows the wrong
+               pick, or the printed margin over the runner-up is slim, set
+               this False and use interactive_setup() /
+               pick_line_endpoints() instead.
     roi_config_path : where to save (interactive setup) or load (saved
                config) the geometry -- lines (with each one's angle and
                reference-line tag), fiducial ROI, mm_per_px, and the
@@ -2284,9 +2527,19 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
             print(f"  cached lock-in result to {cache_file} -- reruns with the same "
                   "loading/registration settings will reuse it (see use_lockin_cache)")
 
+    candidates = n_selected = None
     with _stage("geometry setup"):
         if use_saved_config:
             roi_config = load_roi_config(roi_config_path)
+        elif auto_geometry:
+            if mm_per_px is None:
+                raise ValueError(
+                    "auto_geometry=True needs mm_per_px passed explicitly -- "
+                    "there's no calibration click in automatic mode"
+                )
+            roi_config, candidates, n_selected = auto_setup(
+                amp, f_excite, mm_per_px, n_lines=n_lines,
+                mask_polarity=mask_polarity, mask_close_px=mask_close_px)
         else:
             roi_config = interactive_setup(amp, n_lines=n_lines,
                                            calibrate=(mm_per_px is None),
@@ -2377,13 +2630,50 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         disp = np.where(part, amp, np.nan)
         lo, hi = np.nanpercentile(disp, [2, 98])
 
-        # Mask and scale the phase panel the same way -- background pixels
-        # carry no coherent signal at the lock-in frequency, so their phase
-        # is essentially random.  Left in, that speckle both stretches the
+        # Mask and scale the phase panel -- background pixels carry no
+        # coherent signal at the lock-in frequency, so their phase is
+        # essentially random; left in, that speckle both stretches the
         # colour scale until the real part looks uniformly flat and buries
-        # the part's outline in noise; masked out, the part's own phase
-        # variation gets the full colour range.
-        phase_deg = np.where(part, np.degrees(phase), np.nan)
+        # the part's outline in noise.  But part_mask() is a
+        # brightness/geometry mask, not a reach/SNR one -- amplitude AND
+        # phase both degrade with distance from wherever the excitation
+        # actually couples in (amplitude decays at the diffusion-length
+        # scale; a thermal wave's phase lag keeps growing with propagation
+        # distance, in principle without bound), so plenty of pixels
+        # geometrically inside the part can be far enough from the source
+        # that amplitude is near the noise floor AND phase has genuinely
+        # wrapped one or more times -- neither a denoising step nor a
+        # smarter branch-cut placement recovers a trustworthy value out
+        # there (confirmed directly: on real data, spatially smoothing
+        # phase's complex representation barely moved its concentration,
+        # ruling out ordinary per-pixel noise as the cause -- see
+        # _phase_display_mask()'s docstring for the full reasoning and the
+        # 180-degrees-plus-then-a-cliff-to-under-10 evidence).
+        # _phase_display_mask() finds the amplitude/noise-floor cutoff
+        # (empirically, per recording -- this boundary is set by the
+        # excitation geometry, not a universal constant) above which the
+        # surviving phase actually IS concentrated, then recentres the
+        # branch cut on that population's circular mean.  `phase` itself is
+        # referenced to the fiducial ROI (0 deg there) upstream and stays
+        # that way everywhere else (including the per-line analysis below)
+        # -- both the masking and the recentring here are display-only,
+        # local to this panel.
+        phase_mask, phase_k, circ_ref, phase_span = _phase_display_mask(amp, phase, part, nf)
+        phase_frac = phase_mask.sum() / max(int(part.sum()), 1)
+        if phase_mask.sum() < part.sum():
+            print(f"  phase panel: masking to amp > {phase_k:g}x noise floor "
+                  f"({100 * phase_frac:.0f}% of part) keeps the display "
+                  f"within a {phase_span:.0f} deg spread -- farther from the "
+                  "excitation, phase has genuinely wrapped, not just "
+                  "drifted off-centre (see _phase_display_mask())")
+        if phase_k is None:
+            print(f"  WARNING: phase panel: even the loosest amplitude/"
+                  f"noise-floor threshold tried still spans "
+                  f"{phase_span:.0f} deg -- this part may be imaged well "
+                  "beyond where phase is usable at this excitation "
+                  "frequency/frame count")
+        phase_disp = np.angle(np.exp(1j * (phase - circ_ref)))
+        phase_deg = np.where(phase_mask, np.degrees(phase_disp), np.nan)
         lo_p, hi_p = np.nanpercentile(phase_deg, [2, 98])
 
         fig, ax = plt.subplots(1, 3, figsize=(16, 5))
@@ -2395,7 +2685,10 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         im1 = ax[1].imshow(disp, vmin=lo, vmax=hi)
         ax[1].set_title("amplitude (masked)")
         im2 = ax[2].imshow(phase_deg, cmap="twilight", vmin=lo_p, vmax=hi_p)
-        ax[2].set_title("phase [deg]")
+        phase_title = "phase [deg]"
+        if phase_k is not None and phase_mask.sum() < part.sum():
+            phase_title += f"  (amp > {phase_k:g}x nf, {100 * phase_frac:.0f}% of part)"
+        ax[2].set_title(phase_title)
         for a, im in zip(ax, (im0, im1, im2)):
             fig.colorbar(im, ax=a, fraction=0.046)
 
@@ -2413,6 +2706,9 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
         fig.text(0.5, 0.005, params_str, ha="center", fontsize=8, color="dimgray")
         fig.savefig("lockin_images.png", dpi=150)
         plt.close(fig)
+
+        if candidates is not None:
+            plot_line_candidates(amp, part, candidates, n_selected, fiducial_roi)
 
     with _stage("symmetric/antisymmetric line analysis"):
         results = []
@@ -2545,22 +2841,30 @@ def analyse(path, fps, f_excite, mm_per_px=None, n_lines=1,
 # ----------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # First run on a new recording: click through setup (use_saved_config
-    # left False, the default) -- n_lines deletion lines, the fiducial ROI,
-    # and (since mm_per_px is left unset here) a calibration pair.  This
-    # saves roi_config.json.  Every later run of the SAME recording: set
-    # use_saved_config=True to reload that JSON and skip clicking entirely
-    # -- this also works headless (no display needed at all).
+    # First run on a new recording: auto_geometry=True (the default) detects
+    # n_lines deletion lines and places the fiducial ROI automatically, no
+    # clicking, no display needed at all.  Requires mm_per_px explicitly --
+    # there's no calibration click in this path.  This saves roi_config.json.
+    # ALWAYS check lockin_line_candidates.png afterwards: it shows every
+    # candidate line the detector considered (faded) and which one(s) it
+    # selected (solid) -- confirm the pick before trusting the run.  If it
+    # picked wrong (locked onto a genuine zone-to-zone step instead of the
+    # real deletion line -- see analyse()'s docstring on auto_geometry),
+    # rerun with auto_geometry=False to click through interactive_setup()
+    # instead.  Every later run of the SAME recording: set
+    # use_saved_config=True to reload roi_config.json and skip detection
+    # entirely (auto_geometry is then ignored).
     analyse(
-        path="FLIR0023.csq",
+        path="FLIR0022.csq",
         fps=30.0,
         f_excite=0.1,
-        n_lines=1,                 # how many deletion lines to click
+        mm_per_px=2.23,            # required when auto_geometry=True
+        n_lines=1,                 # how many deletion lines to detect
         use_saved_config=False,    # True to reload roi_config.json instead
         roi_config_path="roi_config.json",
-        # mm_per_px left as None -- calibrated by clicking a known distance
-        # during interactive setup.  Pass a number here to skip that and
-        # use a fixed value instead.
+        # auto_geometry=True (the default) -- set False for interactive_setup()
+        # (click-through, with an optional calibration pair if mm_per_px is
+        # left unset) instead of automatic detection.
         # register=False (the default) -- turn on only if the part's
         # material has enough thermal expansion to plausibly move a
         # measurable fraction of a pixel against its fixture; see
